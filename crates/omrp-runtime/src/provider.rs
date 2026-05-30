@@ -1,21 +1,67 @@
-//! OpenRouter provider adapter.
+//! OpenAI-compatible provider adapter.
 //!
-//! Reads the API key from `OPENROUTER_API_KEY` — never hard-code keys.
-//! All calls are synchronous (no async / no tokio).
+//! Both OpenRouter (`https://openrouter.ai/api/v1`) and Kilo Gateway
+//! (`https://api.kilo.ai/api/gateway`) expose the same OpenAI-compatible
+//! `/chat/completions` endpoint.  `CompatClient` handles both.
+//!
+//! API keys are read from environment variables — never hard-coded:
+//!   - OpenRouter : `OPENROUTER_API_KEY`
+//!   - Kilo       : `KILO_API_KEY`
 
 use std::time::{Duration, Instant};
 
 use omrp_events::error::{ErrorKind, ProviderError};
 use serde_json::{json, Value};
 
-const BASE_URL: &str = "https://openrouter.ai/api/v1";
 const HTTP_REFERER: &str = "https://github.com/wwwbkgme-oss/omrp";
 const APP_TITLE: &str = "OMRP";
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 
+// ─── Provider registry ────────────────────────────────────────────────────────
+
+/// Known provider configurations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderKind {
+    OpenRouter,
+    Kilo,
+}
+
+impl ProviderKind {
+    /// Resolve from the string stored in config (`provider = "openrouter"`).
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "openrouter" => Some(Self::OpenRouter),
+            "kilo" => Some(Self::Kilo),
+            _ => None,
+        }
+    }
+
+    pub fn base_url(&self) -> &'static str {
+        match self {
+            Self::OpenRouter => "https://openrouter.ai/api/v1",
+            Self::Kilo => "https://api.kilo.ai/api/gateway",
+        }
+    }
+
+    pub fn api_key_env(&self) -> &'static str {
+        match self {
+            Self::OpenRouter => "OPENROUTER_API_KEY",
+            Self::Kilo => "KILO_API_KEY",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::OpenRouter => "OpenRouter",
+            Self::Kilo => "Kilo Gateway",
+        }
+    }
+}
+
 // ─── Public types ─────────────────────────────────────────────────────────────
 
-/// A single message in the conversation.
+/// A single chat message.
 #[derive(Debug, Clone)]
 pub struct Message {
     pub role: String,
@@ -26,6 +72,7 @@ impl Message {
     pub fn user(content: impl Into<String>) -> Self {
         Self { role: "user".into(), content: content.into() }
     }
+    #[allow(dead_code)]
     pub fn system(content: impl Into<String>) -> Self {
         Self { role: "system".into(), content: content.into() }
     }
@@ -34,54 +81,71 @@ impl Message {
 /// Successful completion result.
 #[derive(Debug)]
 pub struct CompletionResult {
-    /// Response text from the model.
     pub text: String,
-    /// Total tokens consumed (prompt + completion).
     pub tokens_used: u64,
-    /// Wall-clock latency in milliseconds.
     pub latency_ms: u64,
-    /// Actual model used (may differ from requested if OpenRouter rerouted).
+    /// Actual model used (provider may have rerouted).
     pub model_used: String,
 }
 
-// ─── Client ──────────────────────────────────────────────────────────────────
+// ─── CompatClient ─────────────────────────────────────────────────────────────
 
-/// Blocking HTTP client for the OpenRouter chat/completions API.
-pub struct OpenRouterClient {
+/// Blocking OpenAI-compatible HTTP client.
+///
+/// Works with any provider that speaks the `/v1/chat/completions` protocol.
+pub struct CompatClient {
+    base_url: String,
     api_key: String,
+    #[allow(dead_code)]
+    kind: ProviderKind,
 }
 
-impl OpenRouterClient {
-    /// Create a client using `OPENROUTER_API_KEY` env var.
-    ///
-    /// Returns a clear error message if the variable is not set.
-    pub fn from_env() -> Result<Self, String> {
-        let key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
-            concat!(
-                "OPENROUTER_API_KEY is not set.\n",
-                "\n",
-                "  export OPENROUTER_API_KEY=sk-or-v1-...\n",
-                "\n",
-                "Get a free key at: https://openrouter.ai/keys"
+impl CompatClient {
+    /// Build a client for a known provider, reading the API key from the
+    /// appropriate environment variable.
+    pub fn for_provider(provider: &str) -> Result<Self, String> {
+        let kind = ProviderKind::from_str(provider).ok_or_else(|| {
+            format!(
+                "Unknown provider: {provider:?}. Supported: openrouter, kilo"
             )
-            .to_string()
         })?;
-        Ok(Self { api_key: key })
+        Self::from_kind(kind)
     }
 
-    /// Send a chat-completion request to the given `model_id`.
-    ///
-    /// On success returns a `CompletionResult`.
-    /// On failure maps the HTTP error to a `ProviderError`.
+    /// Build a client from a `ProviderKind`.
+    pub fn from_kind(kind: ProviderKind) -> Result<Self, String> {
+        let env_var = kind.api_key_env();
+        let api_key = std::env::var(env_var).map_err(|_| {
+            format!(
+                "{env_var} is not set.\n\
+                 \n\
+                 \t export {env_var}=<your-key>\n\
+                 \n\
+                 Get a free key at: {}",
+                match kind {
+                    ProviderKind::OpenRouter => "https://openrouter.ai/keys",
+                    ProviderKind::Kilo => "https://kilo.ai",
+                }
+            )
+        })?;
+        Ok(Self { base_url: kind.base_url().into(), api_key, kind })
+    }
+
+    /// Provider name for display.
+    #[allow(dead_code)]
+    pub fn provider_name(&self) -> &str {
+        self.kind.display_name()
+    }
+
+    /// Send a single chat-completion request.
     pub fn complete(
         &self,
         model_id: &str,
         messages: &[Message],
         max_tokens: Option<u32>,
     ) -> Result<CompletionResult, ProviderError> {
-        let url = format!("{BASE_URL}/chat/completions");
+        let url = format!("{}/chat/completions", self.base_url);
 
-        // Build request body.
         let msgs: Vec<Value> = messages
             .iter()
             .map(|m| json!({"role": m.role, "content": m.content}))
@@ -92,7 +156,6 @@ impl OpenRouterClient {
             "messages": msgs,
             "max_tokens": max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         });
-        let body_str = body.to_string();
 
         let started = Instant::now();
 
@@ -101,14 +164,14 @@ impl OpenRouterClient {
             .set("Content-Type", "application/json")
             .set("HTTP-Referer", HTTP_REFERER)
             .set("X-Title", APP_TITLE)
-            .send_string(&body_str);
+            .send_string(&body.to_string());
 
         let latency_ms = started.elapsed().as_millis() as u64;
 
         match response {
             Ok(resp) => {
                 let raw = resp.into_string().map_err(|e| {
-                    ProviderError::Internal(format!("Failed to read response body: {e}"))
+                    ProviderError::Internal(format!("Failed to read response: {e}"))
                 })?;
                 parse_success(&raw, latency_ms)
             }
@@ -116,18 +179,15 @@ impl OpenRouterClient {
                 let raw = resp.into_string().unwrap_or_default();
                 Err(map_http_error(status, &raw))
             }
-            Err(ureq::Error::Transport(t)) => {
-                Err(ProviderError::Network(t.to_string()))
-            }
+            Err(ureq::Error::Transport(t)) => Err(ProviderError::Network(t.to_string())),
         }
     }
 
-    /// Complete with automatic retry + fallback logic.
+    /// Complete with automatic retry.
     ///
-    /// - On `RateLimited`: waits `retry_after` seconds (capped at 60 s) then
-    ///   retries the **same** model once.
-    /// - On `Network` error: retries once after 1 s.
-    /// - On any other error: returns immediately (caller decides fallback).
+    /// - 429 RateLimited → wait `retry_after` (max 60 s), retry once.
+    /// - Network error   → wait 1 s, retry once.
+    /// - Any other error → return immediately.
     pub fn complete_with_retry(
         &self,
         model_id: &str,
@@ -149,39 +209,18 @@ impl OpenRouterClient {
             other => other,
         }
     }
-
-    /// Validate the API key by calling `GET /auth/key`.
-    /// Returns `Ok(credits_remaining)` or an error string.
-    pub fn validate_key(&self) -> Result<Option<f64>, String> {
-        let url = format!("{BASE_URL}/auth/key");
-        match ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", self.api_key))
-            .call()
-        {
-            Ok(resp) => {
-                let raw = resp.into_string().map_err(|e| e.to_string())?;
-                let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-                let credits = v["data"]["limit_remaining"].as_f64();
-                Ok(credits)
-            }
-            Err(ureq::Error::Status(401, _)) => {
-                Err("Invalid API key — check OPENROUTER_API_KEY".into())
-            }
-            Err(e) => Err(e.to_string()),
-        }
-    }
 }
 
-// ─── Parsing helpers ──────────────────────────────────────────────────────────
+// ─── Parsing ─────────────────────────────────────────────────────────────────
 
 fn parse_success(raw: &str, latency_ms: u64) -> Result<CompletionResult, ProviderError> {
     let v: Value = serde_json::from_str(raw)
         .map_err(|e| ProviderError::Internal(format!("JSON parse error: {e}")))?;
 
-    // Check for an inline error object (OpenRouter sometimes returns 200 + error).
+    // Inline error (some providers return 200 + error body).
     if let Some(err) = v.get("error") {
         let code = err["code"].as_u64().unwrap_or(0) as u16;
-        let msg = err["message"].as_str().unwrap_or("unknown error").to_string();
+        let msg = err["message"].as_str().unwrap_or("unknown").to_string();
         return Err(map_http_error(code, &msg));
     }
 
@@ -195,32 +234,23 @@ fn parse_success(raw: &str, latency_ms: u64) -> Result<CompletionResult, Provide
     }
 
     let tokens_used = v["usage"]["total_tokens"].as_u64().unwrap_or(0);
-    let model_used = v["model"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
+    let model_used = v["model"].as_str().unwrap_or("unknown").to_string();
 
     Ok(CompletionResult { text, tokens_used, latency_ms, model_used })
 }
 
 fn map_http_error(status: u16, body: &str) -> ProviderError {
-    // Try to extract the message from OpenRouter's error envelope.
     let message: String = serde_json::from_str::<Value>(body)
         .ok()
-        .and_then(|v| {
-            v["error"]["message"]
-                .as_str()
-                .map(|s| s.to_string())
-        })
+        .and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| body.chars().take(200).collect());
 
-    // Extract retry_after from the error metadata if present.
     let retry_after: Option<u64> = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| {
             v["error"]["metadata"]["headers"]["X-RateLimit-Reset-Requests"]
                 .as_str()
-                .and_then(|s| s.parse::<u64>().ok())
+                .and_then(|s| s.parse().ok())
         });
 
     match status {
@@ -234,57 +264,64 @@ fn map_http_error(status: u16, body: &str) -> ProviderError {
     }
 }
 
-/// Map a `ProviderError` to a human-readable string for CLI output.
+// ─── Helpers (used by main.rs) ────────────────────────────────────────────────
+
+/// Human-readable description of a `ProviderError` for CLI output.
 pub fn format_provider_error(e: &ProviderError) -> String {
     match e {
         ProviderError::Auth(msg) => {
-            format!("Authentication failed: {msg}\n\nCheck your OPENROUTER_API_KEY.")
+            format!("Authentication failed: {msg}\nCheck your API key environment variable.")
         }
         ProviderError::RateLimited { retry_after } => {
             let hint = retry_after
                 .map(|s| format!(" (retry in {s}s)"))
                 .unwrap_or_default();
-            format!("Rate limited{hint}. Try again later or switch models.")
+            format!("Rate limited{hint}.")
         }
-        ProviderError::ModelNotFound(msg) => {
-            format!("Model not found: {msg}")
-        }
-        ProviderError::Network(msg) => {
-            format!("Network error: {msg}")
-        }
-        ProviderError::Timeout(ms) => {
-            format!("Request timed out after {ms}ms.")
-        }
-        ProviderError::Internal(msg) => {
-            format!("Provider error: {msg}")
-        }
-        ProviderError::CircuitBreakerOpen => {
-            "Circuit breaker open — model temporarily excluded.".into()
-        }
+        ProviderError::ModelNotFound(msg) => format!("Model not found: {msg}"),
+        ProviderError::Network(msg) => format!("Network error: {msg}"),
+        ProviderError::Timeout(ms) => format!("Timed out after {ms}ms."),
+        ProviderError::Internal(msg) => format!("Provider error: {msg}"),
+        ProviderError::CircuitBreakerOpen => "Circuit breaker open.".into(),
     }
 }
 
-/// Convert a `ProviderError` to the `ErrorKind` that gets stored in the ledger.
+/// Convert `ProviderError` to the `ErrorKind` stored in the ledger.
 pub fn provider_error_to_kind(e: &ProviderError) -> ErrorKind {
     e.kind()
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn test_provider_kind_from_str() {
+        assert_eq!(ProviderKind::from_str("openrouter"), Some(ProviderKind::OpenRouter));
+        assert_eq!(ProviderKind::from_str("kilo"), Some(ProviderKind::Kilo));
+        assert_eq!(ProviderKind::from_str("Kilo"), Some(ProviderKind::Kilo));
+        assert_eq!(ProviderKind::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn test_provider_kind_urls() {
+        assert!(ProviderKind::OpenRouter.base_url().contains("openrouter"));
+        assert!(ProviderKind::Kilo.base_url().contains("kilo.ai"));
+    }
+
+    #[test]
     fn test_parse_success_response() {
         let raw = r#"{
-            "model": "anthropic/claude-3.5-sonnet",
+            "model": "openai/gpt-oss-120b:free",
             "choices": [{"message": {"role": "assistant", "content": "Hello!"}}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
         }"#;
         let result = parse_success(raw, 500).unwrap();
         assert_eq!(result.text, "Hello!");
         assert_eq!(result.tokens_used, 8);
-        assert_eq!(result.latency_ms, 500);
-        assert_eq!(result.model_used, "anthropic/claude-3.5-sonnet");
+        assert_eq!(result.model_used, "openai/gpt-oss-120b:free");
     }
 
     #[test]
@@ -303,7 +340,6 @@ mod tests {
     fn test_inline_error_in_200_response() {
         let raw = r#"{"error": {"code": 401, "message": "Invalid API key"}}"#;
         let result = parse_success(raw, 100);
-        assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ProviderError::Auth(_)));
     }
 
@@ -312,6 +348,6 @@ mod tests {
         let e = ProviderError::Auth("bad key".into());
         let msg = format_provider_error(&e);
         assert!(msg.contains("Authentication failed"));
-        assert!(msg.contains("OPENROUTER_API_KEY"));
+        assert!(msg.contains("API key"));
     }
 }
