@@ -19,3 +19,4 @@ toml.workspace     = true
 dirs.workspace     = true
 ratatui.workspace  = true
 crossterm.workspace = true
+tiny_http.workspace = true

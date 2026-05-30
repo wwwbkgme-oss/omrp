@@ -68,6 +68,7 @@ impl CavemanLevel {
 
 // ─── Caveman prompts (adapted from 9router, MIT) ──────────────────────────────
 
+#[allow(dead_code)]
 const SHARED: &str =
     "Code blocks, file paths, commands, errors, URLs: keep exact. \
      Security warnings, irreversible action confirmations, multi-step ordered sequences: \
