@@ -152,6 +152,35 @@ impl CompatClient {
         self.kind.display_name()
     }
 
+    /// Make a **streaming** chat request.
+    ///
+    /// Returns the raw SSE `Box<dyn Read>` body on success.
+    /// The caller is responsible for forwarding chunks to the client.
+    /// Errors that arrive as HTTP status codes (4xx/5xx) are mapped to
+    /// `ProviderError` before returning so the caller can try a fallback.
+    pub fn stream_request(
+        &self,
+        body: &Value,
+    ) -> Result<Box<dyn std::io::Read + Send + 'static>, ProviderError> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let body_str = body.to_string();
+
+        match ureq::post(&url)
+            .set("Authorization", &format!("Bearer {}", self.api_key))
+            .set("Content-Type", "application/json")
+            .set("HTTP-Referer", HTTP_REFERER)
+            .set("X-Title", APP_TITLE)
+            .send_string(&body_str)
+        {
+            Ok(resp)  => Ok(Box::new(resp.into_reader())),
+            Err(ureq::Error::Status(status, resp)) => {
+                let raw = resp.into_string().unwrap_or_default();
+                Err(map_http_error(status, &raw))
+            }
+            Err(ureq::Error::Transport(t)) => Err(ProviderError::Network(t.to_string())),
+        }
+    }
+
     /// Send a single chat-completion request.
     pub fn complete(
         &self,
