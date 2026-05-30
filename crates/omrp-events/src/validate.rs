@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use crate::event::Event;
-use crate::error::ErrorKind;
 
 /// Validation errors for `Event` variants.
 #[derive(Debug, Serialize, Deserialize)]
