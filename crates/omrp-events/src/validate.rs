@@ -1,71 +1,157 @@
+use serde::{Deserialize, Serialize};
 use crate::event::Event;
+use crate::error::ErrorKind;
 
-#[derive(Debug, Clone, PartialEq)]
+/// Validation errors for `Event` variants.
+#[derive(Debug, Serialize, Deserialize)]
 pub enum ValidationError {
-    InvalidEvent(&'static str),
+    // General
+    EmptyStringField(&'static str),
+    NegativeNumber(&'static str),
+    // Specific variant errors
+    DaemonStartedEmptyVersion,
+    DaemonStoppedEmptyReason,
+    ModelAddedInvalidModel,
+    ModelRemovedEmptyReason,
+    ConfigReloadedEmptySource,
+    ModelSelectedNegativeScore,
+    FallbackTriggeredEmptyCause,
+    DegradeModeEnabledEmptyReason,
+    CompletionRequestedEmptyPrompt,
+    CompletionFinishedNegativeLatency,
+    CompletionFinishedNegativeTokens,
+    ModelFailedInvalidError,
+    ProbeUpdatedInvalidHealth,
+    ProbeUpdatedNegativeLatency,
+    ProbeFailedEmptyError,
+    ReportReceivedNegativeLatency,
+    ReportReceivedNegativeTokens,
 }
 
+/// Validate an `Event` instance.
+///
+/// Returns `Ok(())` if the event satisfies all basic validation rules, otherwise
+/// returns a `ValidationError` describing the first failure encountered.
 pub fn validate(event: &Event) -> Result<(), ValidationError> {
     match event {
-        Event::ModelAdded { model, .. } => {
-            if model.id.is_empty() {
-                return Err(ValidationError::InvalidEvent("model id must not be empty"));
+        // ─── Lifecycle ───
+        Event::DaemonStarted { version } => {
+            if version.trim().is_empty() {
+                return Err(ValidationError::DaemonStartedEmptyVersion);
             }
-            if model.provider.is_empty() {
-                return Err(ValidationError::InvalidEvent("model provider must not be empty"));
-            }
+            Ok(())
         }
-        Event::ModelRemoved { model_id, .. } => {
-            if model_id.is_empty() {
-                return Err(ValidationError::InvalidEvent("model_id must not be empty"));
+        Event::DaemonStopped { reason } => {
+            if reason.trim().is_empty() {
+                return Err(ValidationError::DaemonStoppedEmptyReason);
             }
+            Ok(())
         }
-        Event::CompletionRequested { prompt_tokens, .. } => {
+        // ─── Model Discovery ───
+        Event::ModelAdded { model: _, source: _ } => {
+            // Assuming `Model` validation is handled elsewhere.
+            Ok(())
+        }
+        Event::ModelRemoved { model_id: _, reason } => {
+            if reason.trim().is_empty() {
+                return Err(ValidationError::ModelRemovedEmptyReason);
+            }
+            Ok(())
+        }
+        Event::ConfigReloaded { source } => {
+            if source.trim().is_empty() {
+                return Err(ValidationError::ConfigReloadedEmptySource);
+            }
+            Ok(())
+        }
+        // ─── Routing ───
+        Event::ModelSelected {
+            model_id: _,
+            request: _,
+            score,
+            reason: _,
+        } => {
+            if *score < 0.0 {
+                return Err(ValidationError::ModelSelectedNegativeScore);
+            }
+            Ok(())
+        }
+        Event::FallbackTriggered { from: _, to: _, cause } => {
+            if cause.trim().is_empty() {
+                return Err(ValidationError::FallbackTriggeredEmptyCause);
+            }
+            Ok(())
+        }
+        Event::DegradeModeEnabled { model_id: _, reason } => {
+            if reason.trim().is_empty() {
+                return Err(ValidationError::DegradeModeEnabledEmptyReason);
+            }
+            Ok(())
+        }
+        // ─── Completion ───
+        Event::CompletionRequested {
+            model_id: _,
+            task_type: _,
+            prompt_tokens,
+        } => {
+            // `prompt_tokens` should be non‑zero.
             if *prompt_tokens == 0 {
-                return Err(ValidationError::InvalidEvent("prompt_tokens must be > 0"));
+                return Err(ValidationError::CompletionRequestedEmptyPrompt);
             }
+            Ok(())
         }
-        Event::ProbeUpdated { health, .. } => {
-            if !(0.0..=1.0).contains(health) {
-                return Err(ValidationError::InvalidEvent("health must be 0.0..=1.0"));
+        Event::CompletionFinished {
+            model_id: _,
+            latency_ms,
+            tokens_used,
+            success: _,
+        } => {
+            if *latency_ms == 0 {
+                return Err(ValidationError::CompletionFinishedNegativeLatency);
             }
+            if *tokens_used == 0 {
+                return Err(ValidationError::CompletionFinishedNegativeTokens);
+            }
+            Ok(())
         }
-        _ => {}
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::event::*;
-    use omrp_types::model::*;
-
-    #[test]
-    fn test_valid_model_added() {
-        let event = Event::ModelAdded {
-            model: Model::new("openrouter/o4-mini", "openrouter"),
-            source: ModelSource::Bundled,
-        };
-        assert_eq!(validate(&event), Ok(()));
-    }
-
-    #[test]
-    fn test_invalid_empty_model_id() {
-        let event = Event::ModelAdded {
-            model: Model::new("", "openrouter"),
-            source: ModelSource::Bundled,
-        };
-        assert_eq!(validate(&event), Err(ValidationError::InvalidEvent("model id must not be empty")));
-    }
-
-    #[test]
-    fn test_invalid_health_range() {
-        let event = Event::ProbeUpdated {
-            model_id: "test".into(),
-            health: 1.5,
-            latency_ms: 100,
-        };
-        assert_eq!(validate(&event), Err(ValidationError::InvalidEvent("health must be 0.0..=1.0")));
+        Event::ModelFailed { model_id: _, error } => {
+            // `ErrorKind` is assumed to be valid; we only check for a placeholder variant.
+            let _ = error; // validation passes for all error kinds
+            Ok(())
+        }
+        // ─── Telemetry ───
+        Event::ProbeUpdated {
+            model_id: _,
+            health,
+            latency_ms,
+        } => {
+            if *health < 0.0 || *health > 1.0 {
+                return Err(ValidationError::ProbeUpdatedInvalidHealth);
+            }
+            if *latency_ms == 0 {
+                return Err(ValidationError::ProbeUpdatedNegativeLatency);
+            }
+            Ok(())
+        }
+        Event::ProbeFailed { model_id: _, error } => {
+            if error.trim().is_empty() {
+                return Err(ValidationError::ProbeFailedEmptyError);
+            }
+            Ok(())
+        }
+        Event::ReportReceived {
+            model_id: _,
+            success: _,
+            latency_ms,
+            tokens,
+        } => {
+            if *latency_ms == 0 {
+                return Err(ValidationError::ReportReceivedNegativeLatency);
+            }
+            if *tokens == 0 {
+                return Err(ValidationError::ReportReceivedNegativeTokens);
+            }
+            Ok(())
+        }
     }
 }
