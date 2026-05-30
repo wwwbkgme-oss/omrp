@@ -1,0 +1,10 @@
+[package]
+name = "omrp-events"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omrp-types = { path = "../omrp-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
