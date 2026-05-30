@@ -1,12 +1,11 @@
 //! OpenAI-compatible provider adapter.
 //!
-//! Both OpenRouter (`https://openrouter.ai/api/v1`) and Kilo Gateway
-//! (`https://api.kilo.ai/api/gateway`) expose the same OpenAI-compatible
-//! `/chat/completions` endpoint.  `CompatClient` handles both.
-//!
+//! All supported providers expose the same `/chat/completions` endpoint.
 //! API keys are read from environment variables — never hard-coded:
-//!   - OpenRouter : `OPENROUTER_API_KEY`
-//!   - Kilo       : `KILO_API_KEY`
+//!   - OpenRouter : `OPENROUTER_API_KEY`   https://openrouter.ai/keys
+//!   - Kilo       : `KILO_API_KEY`         https://kilo.ai
+//!   - Cerebras   : `CEREBRAS_API_KEY`     https://cloud.cerebras.ai
+//!   - Groq       : `GROQ_API_KEY`         https://console.groq.com
 
 use std::time::{Duration, Instant};
 
@@ -19,19 +18,27 @@ const DEFAULT_MAX_TOKENS: u32 = 1024;
 
 // ─── Provider registry ────────────────────────────────────────────────────────
 
-/// Known provider configurations.
+/// Known OpenAI-compatible provider backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderKind {
+    /// https://openrouter.ai — OPENROUTER_API_KEY — 50-1000 free req/day
     OpenRouter,
+    /// https://kilo.ai — KILO_API_KEY — kilo/auto-free smart router
     Kilo,
+    /// https://cloud.cerebras.ai — CEREBRAS_API_KEY — 14,400 req/day, wafer-fast
+    Cerebras,
+    /// https://console.groq.com — GROQ_API_KEY — 1,000-14,400 req/day, ultra-low latency
+    Groq,
 }
 
 impl ProviderKind {
-    /// Resolve from the string stored in config (`provider = "openrouter"`).
+    /// Resolve from the string stored in config (`provider = "groq"`).
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "openrouter" => Some(Self::OpenRouter),
-            "kilo" => Some(Self::Kilo),
+            "kilo"       => Some(Self::Kilo),
+            "cerebras"   => Some(Self::Cerebras),
+            "groq"       => Some(Self::Groq),
             _ => None,
         }
     }
@@ -39,14 +46,18 @@ impl ProviderKind {
     pub fn base_url(&self) -> &'static str {
         match self {
             Self::OpenRouter => "https://openrouter.ai/api/v1",
-            Self::Kilo => "https://api.kilo.ai/api/gateway",
+            Self::Kilo       => "https://api.kilo.ai/api/gateway",
+            Self::Cerebras   => "https://api.cerebras.ai/v1",
+            Self::Groq       => "https://api.groq.com/openai/v1",
         }
     }
 
     pub fn api_key_env(&self) -> &'static str {
         match self {
             Self::OpenRouter => "OPENROUTER_API_KEY",
-            Self::Kilo => "KILO_API_KEY",
+            Self::Kilo       => "KILO_API_KEY",
+            Self::Cerebras   => "CEREBRAS_API_KEY",
+            Self::Groq       => "GROQ_API_KEY",
         }
     }
 
@@ -54,7 +65,9 @@ impl ProviderKind {
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::OpenRouter => "OpenRouter",
-            Self::Kilo => "Kilo Gateway",
+            Self::Kilo       => "Kilo Gateway",
+            Self::Cerebras   => "Cerebras",
+            Self::Groq       => "Groq",
         }
     }
 }
@@ -124,7 +137,9 @@ impl CompatClient {
                  Get a free key at: {}",
                 match kind {
                     ProviderKind::OpenRouter => "https://openrouter.ai/keys",
-                    ProviderKind::Kilo => "https://kilo.ai",
+                    ProviderKind::Kilo       => "https://kilo.ai",
+                    ProviderKind::Cerebras   => "https://cloud.cerebras.ai",
+                    ProviderKind::Groq       => "https://console.groq.com",
                 }
             )
         })?;
@@ -300,15 +315,20 @@ mod tests {
     #[test]
     fn test_provider_kind_from_str() {
         assert_eq!(ProviderKind::from_str("openrouter"), Some(ProviderKind::OpenRouter));
-        assert_eq!(ProviderKind::from_str("kilo"), Some(ProviderKind::Kilo));
-        assert_eq!(ProviderKind::from_str("Kilo"), Some(ProviderKind::Kilo));
-        assert_eq!(ProviderKind::from_str("unknown"), None);
+        assert_eq!(ProviderKind::from_str("kilo"),       Some(ProviderKind::Kilo));
+        assert_eq!(ProviderKind::from_str("Kilo"),       Some(ProviderKind::Kilo));
+        assert_eq!(ProviderKind::from_str("cerebras"),   Some(ProviderKind::Cerebras));
+        assert_eq!(ProviderKind::from_str("groq"),       Some(ProviderKind::Groq));
+        assert_eq!(ProviderKind::from_str("Groq"),       Some(ProviderKind::Groq));
+        assert_eq!(ProviderKind::from_str("unknown"),    None);
     }
 
     #[test]
     fn test_provider_kind_urls() {
         assert!(ProviderKind::OpenRouter.base_url().contains("openrouter"));
         assert!(ProviderKind::Kilo.base_url().contains("kilo.ai"));
+        assert!(ProviderKind::Cerebras.base_url().contains("cerebras"));
+        assert!(ProviderKind::Groq.base_url().contains("groq"));
     }
 
     #[test]
