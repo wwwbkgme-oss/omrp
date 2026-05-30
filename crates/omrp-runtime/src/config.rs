@@ -99,24 +99,41 @@ impl Config {
 
     /// Built-in model list — used when no config file exists.
     ///
-    /// Leads with free-tier models (`:free` suffix on OpenRouter) so the
-    /// router works out of the box even on a zero-credit account.
-    /// Paid models are listed last as fallbacks when free slots are full.
+    /// All models are free-tier (`:free` suffix on OpenRouter) — no credits
+    /// required.  Ordered by quality/context so the best model is tried first
+    /// when health scores are equal.
     pub fn builtin_defaults() -> Self {
         Self {
             daemon: DaemonConfig { ledger_path: None },
             model: vec![
-                // ── Free-tier models (no credits required) ──────────────────
+                // Large, capable, 1 M ctx
                 ModelConfig {
-                    id: "openai/gpt-oss-20b:free".into(),
+                    id: "qwen/qwen3-coder:free".into(),
                     provider: "openrouter".into(),
-                    tasks: vec!["chat".into(), "code".into(), "reasoning".into()],
+                    tasks: vec!["code".into(), "reasoning".into(), "analysis".into()],
+                    tool_use: false,
+                    vision: false,
+                    ctx: 1_048_576,
+                },
+                ModelConfig {
+                    id: "deepseek/deepseek-v4-flash:free".into(),
+                    provider: "openrouter".into(),
+                    tasks: vec!["code".into(), "reasoning".into(), "chat".into()],
+                    tool_use: false,
+                    vision: false,
+                    ctx: 1_048_576,
+                },
+                // General-purpose 128 k ctx
+                ModelConfig {
+                    id: "openai/gpt-oss-120b:free".into(),
+                    provider: "openrouter".into(),
+                    tasks: vec!["code".into(), "reasoning".into(), "chat".into(), "analysis".into()],
                     tool_use: false,
                     vision: false,
                     ctx: 128_000,
                 },
                 ModelConfig {
-                    id: "openai/gpt-oss-120b:free".into(),
+                    id: "nousresearch/hermes-3-llama-3.1-405b:free".into(),
                     provider: "openrouter".into(),
                     tasks: vec!["code".into(), "reasoning".into(), "chat".into(), "analysis".into()],
                     tool_use: false,
@@ -131,30 +148,30 @@ impl Config {
                     vision: false,
                     ctx: 131_072,
                 },
-                // ── Paid models (fallback / higher quality) ─────────────────
+                // Fast, lower-latency fallbacks
                 ModelConfig {
-                    id: "anthropic/claude-3.5-haiku".into(),
+                    id: "openai/gpt-oss-20b:free".into(),
                     provider: "openrouter".into(),
-                    tasks: vec!["code".into(), "reasoning".into(), "chat".into(), "analysis".into()],
-                    tool_use: true,
+                    tasks: vec!["chat".into(), "code".into(), "reasoning".into()],
+                    tool_use: false,
                     vision: false,
-                    ctx: 200_000,
-                },
-                ModelConfig {
-                    id: "openai/gpt-4o-mini".into(),
-                    provider: "openrouter".into(),
-                    tasks: vec!["chat".into(), "code".into(), "analysis".into()],
-                    tool_use: true,
-                    vision: true,
                     ctx: 128_000,
                 },
                 ModelConfig {
-                    id: "qwen/qwen-2.5-72b-instruct".into(),
+                    id: "google/gemma-4-31b-it:free".into(),
                     provider: "openrouter".into(),
-                    tasks: vec!["code".into(), "chat".into(), "reasoning".into()],
+                    tasks: vec!["chat".into(), "analysis".into(), "reasoning".into()],
                     tool_use: false,
                     vision: false,
-                    ctx: 32_768,
+                    ctx: 262_144,
+                },
+                ModelConfig {
+                    id: "nvidia/nemotron-3-super-120b-a12b:free".into(),
+                    provider: "openrouter".into(),
+                    tasks: vec!["reasoning".into(), "code".into(), "chat".into()],
+                    tool_use: false,
+                    vision: false,
+                    ctx: 999_424,
                 },
             ],
         }
@@ -241,71 +258,73 @@ fn expand_tilde(s: &str) -> PathBuf {
 
 /// Written to disk on first run if no config exists.
 static DEFAULT_CONFIG_TOML: &str = r#"# OMRP configuration
-# API keys are read from environment variables — never put them here.
+# All models below are free-tier — no credits required.
+# API keys are read from environment variables, never stored here.
 #
 # Quick start:
 #   export OPENROUTER_API_KEY=sk-or-v1-...
-#   omrp route "write a hello world in Rust"
+#   omrp route "write a fibonacci function in Rust"
 #
-# Free-tier models (marked :free) work without spending credits.
-# Paid models deliver higher quality when you have a funded account.
+# To see live model health and routing scores:
+#   omrp status
+#
+# Add or remove [[model]] sections to change the pool.
+# Browse free models at: https://openrouter.ai/models?order=newest&supported_parameters=free
 
 [daemon]
-# Path to the event ledger — persists model health scores across restarts.
-# Defaults to ~/.local/share/omrp/ledger.jsonl if not set.
+# Ledger file — persists health scores across restarts.
+# Defaults to ~/.local/share/omrp/ledger.jsonl
 # ledger_path = "~/.local/share/omrp/ledger.jsonl"
 
-# ─── Free-tier models (no credits required) ───────────────────────────────────
+# ─── Free-tier models (all no credits required) ───────────────────────────────
 
 [[model]]
-id       = "openai/gpt-oss-20b:free"
+id       = "qwen/qwen3-coder:free"
 provider = "openrouter"
-tasks    = ["chat", "code", "reasoning"]
-tool_use = false
-vision   = false
-ctx      = 128000
+tasks    = ["code", "reasoning", "analysis"]
+ctx      = 1048576
+
+[[model]]
+id       = "deepseek/deepseek-v4-flash:free"
+provider = "openrouter"
+tasks    = ["code", "reasoning", "chat"]
+ctx      = 1048576
 
 [[model]]
 id       = "openai/gpt-oss-120b:free"
 provider = "openrouter"
 tasks    = ["code", "reasoning", "chat", "analysis"]
-tool_use = false
-vision   = false
+ctx      = 128000
+
+[[model]]
+id       = "nousresearch/hermes-3-llama-3.1-405b:free"
+provider = "openrouter"
+tasks    = ["code", "reasoning", "chat", "analysis"]
 ctx      = 128000
 
 [[model]]
 id       = "meta-llama/llama-3.3-70b-instruct:free"
 provider = "openrouter"
 tasks    = ["code", "chat", "analysis"]
-tool_use = false
-vision   = false
 ctx      = 131072
 
-# ─── Paid models (higher quality, require credits) ────────────────────────────
-
 [[model]]
-id       = "anthropic/claude-3.5-haiku"
+id       = "openai/gpt-oss-20b:free"
 provider = "openrouter"
-tasks    = ["code", "reasoning", "chat", "analysis"]
-tool_use = true
-vision   = false
-ctx      = 200000
-
-[[model]]
-id       = "openai/gpt-4o-mini"
-provider = "openrouter"
-tasks    = ["chat", "code", "analysis"]
-tool_use = true
-vision   = true
+tasks    = ["chat", "code", "reasoning"]
 ctx      = 128000
 
 [[model]]
-id       = "qwen/qwen-2.5-72b-instruct"
+id       = "google/gemma-4-31b-it:free"
 provider = "openrouter"
-tasks    = ["code", "chat", "reasoning"]
-tool_use = false
-vision   = false
-ctx      = 32768
+tasks    = ["chat", "analysis", "reasoning"]
+ctx      = 262144
+
+[[model]]
+id       = "nvidia/nemotron-3-super-120b-a12b:free"
+provider = "openrouter"
+tasks    = ["reasoning", "code", "chat"]
+ctx      = 999424
 "#;
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -317,12 +336,11 @@ mod tests {
     #[test]
     fn test_builtin_defaults_parses_models() {
         let cfg = Config::builtin_defaults();
-        // 3 free-tier + 3 paid models
-        assert_eq!(cfg.model.len(), 6);
+        assert_eq!(cfg.model.len(), 8, "expect 8 free-tier models");
         let events = cfg.to_model_events();
-        assert_eq!(events.len(), 6);
-        // At least one free-tier model should be present
-        assert!(cfg.model.iter().any(|m| m.id.ends_with(":free")));
+        assert_eq!(events.len(), 8);
+        // Every model must be free-tier
+        assert!(cfg.model.iter().all(|m| m.id.ends_with(":free")));
     }
 
     #[test]
@@ -335,12 +353,11 @@ mod tests {
     #[test]
     fn test_model_capabilities_set_correctly() {
         let cfg = Config::builtin_defaults();
-        let claude = cfg.model.iter().find(|m| m.id.contains("claude")).unwrap();
-        let model = claude.to_model();
-        assert!(model.capabilities.supports_tool_use);
-        assert!(!model.capabilities.supports_vision);
-        assert_eq!(model.capabilities.context_window, 200_000);
+        let qwen = cfg.model.iter().find(|m| m.id.contains("qwen3-coder")).unwrap();
+        let model = qwen.to_model();
         assert!(model.capabilities.task_suitability.contains(&TaskType::Code));
+        assert_eq!(model.capabilities.context_window, 1_048_576);
+        assert!(!model.capabilities.supports_tool_use);
     }
 
     #[test]
