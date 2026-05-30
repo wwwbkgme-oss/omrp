@@ -97,6 +97,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omrp-runtime"
+version = "0.1.0"
+dependencies = [
+ "omrp-core",
+ "omrp-events",
+ "omrp-types",
+ "serde_json",
+]
+
+[[package]]
 name = "omrp-types"
 version = "0.1.0"
 dependencies = [
