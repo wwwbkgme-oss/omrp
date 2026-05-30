@@ -9,10 +9,10 @@
 //!   omrp init            Write default config to ~/.config/omrp/config.toml
 
 mod config;
+mod dashboard;
 mod provider;
 
 use std::path::Path;
-
 use omrp_core::pipeline::EventPipeline;
 use omrp_core::router::RouterEngine;
 use omrp_events::event::Event;
@@ -20,7 +20,7 @@ use omrp_types::task::{RouteRequest, TaskType};
 
 use config::{parse_task_type, Config};
 use provider::{
-    format_provider_error, provider_error_to_kind, Message, OpenRouterClient,
+    format_provider_error, provider_error_to_kind, CompatClient, Message,
 };
 use omrp_events::error::ProviderError;
 
@@ -158,12 +158,6 @@ fn cmd_route(route_args: &[String], cfg: &Config) {
     }
     println!();
 
-    // Get API client.
-    let client = match OpenRouterClient::from_env() {
-        Ok(c) => c,
-        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
-    };
-
     // Emit CompletionRequested.
     let _ = pipeline.process(Event::CompletionRequested {
         model_id: decision.selected_model.clone(),
@@ -176,24 +170,48 @@ fn cmd_route(route_args: &[String], cfg: &Config) {
         Err(ProviderError::Internal("no attempt".into()));
 
     // Try primary model, then each fallback in order.
+    // Each model may belong to a different provider (openrouter / kilo).
+    // We resolve the right CompatClient per model and skip gracefully if the
+    // API key for that provider is not set.
     for (i, model_id) in decision.fallback_chain.iter().enumerate() {
+        // Resolve provider name from state.
+        let provider_name = pipeline.state().read(|s| {
+            s.models
+                .iter()
+                .find(|m| &m.id == model_id)
+                .map(|m| m.provider.clone())
+                .unwrap_or_else(|| "openrouter".into())
+        });
+
+        // Build the client for this provider.
+        let client = match CompatClient::for_provider(&provider_name) {
+            Ok(c) => c,
+            Err(e) => {
+                if i == 0 {
+                    eprintln!("  ✗ {model_id} — skipped: {e}");
+                } else {
+                    eprintln!("  fallback → {model_id} — skipped: {e}");
+                }
+                continue;
+            }
+        };
+
         if i == 0 {
-            eprint!("  calling {}… ", model_id);
+            eprint!("  [{provider_name}] calling {model_id}… ");
         } else {
-            eprint!("  fallback → {}… ", model_id);
+            eprint!("  fallback → [{provider_name}] {model_id}… ");
         }
 
         outcome = client.complete_with_retry(model_id, &messages, max_tokens);
 
         match &outcome {
             Ok(_) => {
-                eprint!("\r{}", " ".repeat(60));
+                eprint!("\r{}", " ".repeat(70));
                 eprint!("\r");
                 break;
             }
             Err(ProviderError::Auth(_)) => {
-                // Auth errors won't resolve by trying a different model.
-                eprintln!("auth error");
+                eprintln!("auth error — check API key for {provider_name}");
                 break;
             }
             Err(e) => {
@@ -362,8 +380,9 @@ fn cmd_init() {
         Ok(()) => {
             println!("Config written to: {}", path.display());
             println!();
-            println!("Next step — set your OpenRouter API key:");
-            println!("  export OPENROUTER_API_KEY=sk-or-v1-...");
+            println!("Set API keys for the providers you want to use:");
+            println!("  export OPENROUTER_API_KEY=sk-or-v1-...   # https://openrouter.ai/keys");
+            println!("  export KILO_API_KEY=...                   # https://kilo.ai");
             println!();
             println!("Then route a request:");
             println!("  omrp route --task code \"write a hello world in Rust\"");
@@ -423,6 +442,13 @@ fn main() {
 
         "init" => cmd_init(),
 
+        "dashboard" => {
+            if let Err(e) = dashboard::run(&cfg) {
+                eprintln!("Dashboard error: {e}");
+                std::process::exit(1);
+            }
+        }
+
         other => {
             eprintln!("Unknown command: {other:?}");
             print_usage();
@@ -440,10 +466,12 @@ fn print_usage() {
     eprintln!("  omrp models       List registered models");
     eprintln!("  omrp status       Health, latency, and routing scores");
     eprintln!("  omrp best <task>  Best model for a task (dry run, no API call)");
+    eprintln!("  omrp dashboard    Live TUI dashboard (q to quit)");
     eprintln!("  omrp init         Create default config at ~/.config/omrp/config.toml");
     eprintln!();
     eprintln!("Task types: code, reasoning, chat, vision, analysis");
     eprintln!();
-    eprintln!("Environment:");
-    eprintln!("  OPENROUTER_API_KEY=sk-or-v1-...   required for omrp route");
+    eprintln!("Environment (set the key for each provider you use):");
+    eprintln!("  OPENROUTER_API_KEY=sk-or-v1-...   https://openrouter.ai/keys");
+    eprintln!("  KILO_API_KEY=...                   https://kilo.ai");
 }

@@ -99,14 +99,42 @@ impl Config {
 
     /// Built-in model list — used when no config file exists.
     ///
-    /// All models are free-tier (`:free` suffix on OpenRouter) — no credits
-    /// required.  Ordered by quality/context so the best model is tried first
-    /// when health scores are equal.
+    /// All models are free-tier.  Kilo Gateway models (provider = "kilo") use
+    /// `KILO_API_KEY`; OpenRouter models use `OPENROUTER_API_KEY`.
     pub fn builtin_defaults() -> Self {
         Self {
             daemon: DaemonConfig { ledger_path: None },
             model: vec![
-                // Large, capable, 1 M ctx
+                // ── Kilo Gateway (KILO_API_KEY) ──────────────────────────────
+                // kilo-auto/free is Kilo's smart router: it automatically picks
+                // the best available free model on Kilo's network.
+                ModelConfig {
+                    id: "kilo-auto/free".into(),
+                    provider: "kilo".into(),
+                    tasks: vec!["code".into(), "reasoning".into(), "chat".into(), "analysis".into()],
+                    tool_use: false,
+                    vision: false,
+                    ctx: 1_048_576,
+                },
+                ModelConfig {
+                    id: "nvidia/nemotron-3-super-120b-a12b:free".into(),
+                    provider: "kilo".into(),
+                    tasks: vec!["reasoning".into(), "code".into(), "chat".into()],
+                    tool_use: false,
+                    vision: false,
+                    ctx: 999_424,
+                },
+                ModelConfig {
+                    id: "poolside/laguna-m.1:free".into(),
+                    provider: "kilo".into(),
+                    tasks: vec!["code".into(), "reasoning".into()],
+                    tool_use: false,
+                    vision: false,
+                    ctx: 262_144,
+                },
+
+                // ── OpenRouter (OPENROUTER_API_KEY) ──────────────────────────
+                // Large context — code and reasoning specialists
                 ModelConfig {
                     id: "qwen/qwen3-coder:free".into(),
                     provider: "openrouter".into(),
@@ -123,7 +151,7 @@ impl Config {
                     vision: false,
                     ctx: 1_048_576,
                 },
-                // General-purpose 128 k ctx
+                // General-purpose
                 ModelConfig {
                     id: "openai/gpt-oss-120b:free".into(),
                     provider: "openrouter".into(),
@@ -148,7 +176,6 @@ impl Config {
                     vision: false,
                     ctx: 131_072,
                 },
-                // Fast, lower-latency fallbacks
                 ModelConfig {
                     id: "openai/gpt-oss-20b:free".into(),
                     provider: "openrouter".into(),
@@ -164,14 +191,6 @@ impl Config {
                     tool_use: false,
                     vision: false,
                     ctx: 262_144,
-                },
-                ModelConfig {
-                    id: "nvidia/nemotron-3-super-120b-a12b:free".into(),
-                    provider: "openrouter".into(),
-                    tasks: vec!["reasoning".into(), "code".into(), "chat".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 999_424,
                 },
             ],
         }
@@ -262,21 +281,41 @@ static DEFAULT_CONFIG_TOML: &str = r#"# OMRP configuration
 # API keys are read from environment variables, never stored here.
 #
 # Quick start:
-#   export OPENROUTER_API_KEY=sk-or-v1-...
+#   export KILO_API_KEY=...           # https://kilo.ai
+#   export OPENROUTER_API_KEY=...     # https://openrouter.ai/keys  (optional)
 #   omrp route "write a fibonacci function in Rust"
 #
-# To see live model health and routing scores:
-#   omrp status
-#
-# Add or remove [[model]] sections to change the pool.
-# Browse free models at: https://openrouter.ai/models?order=newest&supported_parameters=free
+# Run `omrp dashboard` for a live TUI view of model health and routing scores.
+# Browse free models: https://openrouter.ai/models?supported_parameters=free
 
 [daemon]
 # Ledger file — persists health scores across restarts.
 # Defaults to ~/.local/share/omrp/ledger.jsonl
 # ledger_path = "~/.local/share/omrp/ledger.jsonl"
 
-# ─── Free-tier models (all no credits required) ───────────────────────────────
+# ─── Kilo Gateway (KILO_API_KEY) ──────────────────────────────────────────────
+# kilo-auto/free is Kilo's smart auto-router: picks the best available free
+# model on Kilo's network automatically.  Use it as your primary catch-all.
+
+[[model]]
+id       = "kilo-auto/free"
+provider = "kilo"
+tasks    = ["code", "reasoning", "chat", "analysis"]
+ctx      = 1048576
+
+[[model]]
+id       = "nvidia/nemotron-3-super-120b-a12b:free"
+provider = "kilo"
+tasks    = ["reasoning", "code", "chat"]
+ctx      = 999424
+
+[[model]]
+id       = "poolside/laguna-m.1:free"
+provider = "kilo"
+tasks    = ["code", "reasoning"]
+ctx      = 262144
+
+# ─── OpenRouter (OPENROUTER_API_KEY) ──────────────────────────────────────────
 
 [[model]]
 id       = "qwen/qwen3-coder:free"
@@ -319,12 +358,6 @@ id       = "google/gemma-4-31b-it:free"
 provider = "openrouter"
 tasks    = ["chat", "analysis", "reasoning"]
 ctx      = 262144
-
-[[model]]
-id       = "nvidia/nemotron-3-super-120b-a12b:free"
-provider = "openrouter"
-tasks    = ["reasoning", "code", "chat"]
-ctx      = 999424
 "#;
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -336,11 +369,19 @@ mod tests {
     #[test]
     fn test_builtin_defaults_parses_models() {
         let cfg = Config::builtin_defaults();
-        assert_eq!(cfg.model.len(), 8, "expect 8 free-tier models");
+        // 3 Kilo + 7 OpenRouter = 10 total, no duplicates
+        assert_eq!(cfg.model.len(), 10, "expect 10 models (3 kilo + 7 openrouter)");
         let events = cfg.to_model_events();
-        assert_eq!(events.len(), 8);
-        // Every model must be free-tier
-        assert!(cfg.model.iter().all(|m| m.id.ends_with(":free")));
+        assert_eq!(events.len(), 10);
+        // All models must be free-tier: either `:free` suffix OR `kilo-auto/*` OR provider="kilo"
+        assert!(cfg.model.iter().all(|m| {
+            m.id.ends_with(":free")
+                || m.id.starts_with("kilo-auto/")
+                || m.provider == "kilo"
+        }), "every model must be free-tier");
+        // Both providers must be present
+        assert!(cfg.model.iter().any(|m| m.provider == "kilo"));
+        assert!(cfg.model.iter().any(|m| m.provider == "openrouter"));
     }
 
     #[test]
@@ -353,11 +394,11 @@ mod tests {
     #[test]
     fn test_model_capabilities_set_correctly() {
         let cfg = Config::builtin_defaults();
-        let qwen = cfg.model.iter().find(|m| m.id.contains("qwen3-coder")).unwrap();
-        let model = qwen.to_model();
-        assert!(model.capabilities.task_suitability.contains(&TaskType::Code));
+        let kilo_auto = cfg.model.iter().find(|m| m.id == "kilo-auto/free").unwrap();
+        let model = kilo_auto.to_model();
+        assert_eq!(model.provider, "kilo");
         assert_eq!(model.capabilities.context_window, 1_048_576);
-        assert!(!model.capabilities.supports_tool_use);
+        assert!(model.capabilities.task_suitability.contains(&TaskType::Code));
     }
 
     #[test]
