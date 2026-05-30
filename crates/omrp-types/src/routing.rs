@@ -60,14 +60,14 @@ pub struct RoutingCache {
     pub last_fallback: Option<FallbackEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RoutingCacheEntry {
     pub model_id: ModelId,
     pub score: f64,
     pub selected_at: SequencedInstant,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FallbackEntry {
     pub from: ModelId,
     pub to: ModelId,
