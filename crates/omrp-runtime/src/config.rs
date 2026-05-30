@@ -33,9 +33,9 @@ pub struct DaemonConfig {
 /// One `[[model]]` table.
 #[derive(Debug, Deserialize)]
 pub struct ModelConfig {
-    /// Model ID as used in API calls, e.g. `"anthropic/claude-3.5-sonnet"`.
+    /// Model ID as used in API calls.
     pub id: String,
-    /// Provider name, e.g. `"openrouter"`.
+    /// Provider name: openrouter | kilo | cerebras | groq
     pub provider: String,
     /// Task-type strings supported by this model.
     #[serde(default)]
@@ -47,9 +47,27 @@ pub struct ModelConfig {
     /// Maximum context window in tokens.
     #[serde(default = "default_ctx")]
     pub ctx: u32,
+    /// Routing tier: simple | medium | complex | reasoning.
+    /// The classifier picks a tier; models in that tier are preferred.
+    #[serde(default = "default_tier")]
+    pub tier: String,
 }
 
 fn default_ctx() -> u32 { 4096 }
+fn default_tier() -> String { "medium".into() }
+
+/// Shorthand constructor for a free-tier `ModelConfig`.
+fn mc(id: &str, provider: &str, tasks: &[&str], ctx: u32, tier: &str) -> ModelConfig {
+    ModelConfig {
+        id: id.into(),
+        provider: provider.into(),
+        tasks: tasks.iter().map(|s| s.to_string()).collect(),
+        tool_use: false,
+        vision: false,
+        ctx,
+        tier: tier.into(),
+    }
+}
 
 // ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -99,99 +117,46 @@ impl Config {
 
     /// Built-in model list — used when no config file exists.
     ///
-    /// All models are free-tier.  Kilo Gateway models (provider = "kilo") use
-    /// `KILO_API_KEY`; OpenRouter models use `OPENROUTER_API_KEY`.
+    /// All models are permanently free-tier (no credits required).
+    /// Covers four providers; set the corresponding env var for each:
+    ///   Kilo      → KILO_API_KEY       (kilo/auto-free smart router)
+    ///   Cerebras  → CEREBRAS_API_KEY   (wafer-fast, 14k req/day)
+    ///   Groq      → GROQ_API_KEY       (ultra-low latency, 1k-14k req/day)
+    ///   OpenRouter→ OPENROUTER_API_KEY (50-1000 req/day, many models)
     pub fn builtin_defaults() -> Self {
         Self {
             daemon: DaemonConfig { ledger_path: None },
             model: vec![
-                // ── Kilo Gateway (KILO_API_KEY) ──────────────────────────────
-                // kilo-auto/free is Kilo's smart router: it automatically picks
-                // the best available free model on Kilo's network.
-                ModelConfig {
-                    id: "kilo-auto/free".into(),
-                    provider: "kilo".into(),
-                    tasks: vec!["code".into(), "reasoning".into(), "chat".into(), "analysis".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 1_048_576,
-                },
-                ModelConfig {
-                    id: "nvidia/nemotron-3-super-120b-a12b:free".into(),
-                    provider: "kilo".into(),
-                    tasks: vec!["reasoning".into(), "code".into(), "chat".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 999_424,
-                },
-                ModelConfig {
-                    id: "poolside/laguna-m.1:free".into(),
-                    provider: "kilo".into(),
-                    tasks: vec!["code".into(), "reasoning".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 262_144,
-                },
+                // ── Cerebras (CEREBRAS_API_KEY) — wafer-scale, 14,400 req/day ──
+                // Ideal SIMPLE tier: fastest possible inference
+                mc("llama3.1-8b",  "cerebras", &["chat","code"],                    128_000, "simple"),
+                mc("gpt-oss-120b", "cerebras", &["code","reasoning","chat","analysis"], 128_000, "complex"),
 
-                // ── OpenRouter (OPENROUTER_API_KEY) ──────────────────────────
-                // Large context — code and reasoning specialists
-                ModelConfig {
-                    id: "qwen/qwen3-coder:free".into(),
-                    provider: "openrouter".into(),
-                    tasks: vec!["code".into(), "reasoning".into(), "analysis".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 1_048_576,
-                },
-                ModelConfig {
-                    id: "deepseek/deepseek-v4-flash:free".into(),
-                    provider: "openrouter".into(),
-                    tasks: vec!["code".into(), "reasoning".into(), "chat".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 1_048_576,
-                },
-                // General-purpose
-                ModelConfig {
-                    id: "openai/gpt-oss-120b:free".into(),
-                    provider: "openrouter".into(),
-                    tasks: vec!["code".into(), "reasoning".into(), "chat".into(), "analysis".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 128_000,
-                },
-                ModelConfig {
-                    id: "nousresearch/hermes-3-llama-3.1-405b:free".into(),
-                    provider: "openrouter".into(),
-                    tasks: vec!["code".into(), "reasoning".into(), "chat".into(), "analysis".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 128_000,
-                },
-                ModelConfig {
-                    id: "meta-llama/llama-3.3-70b-instruct:free".into(),
-                    provider: "openrouter".into(),
-                    tasks: vec!["code".into(), "chat".into(), "analysis".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 131_072,
-                },
-                ModelConfig {
-                    id: "openai/gpt-oss-20b:free".into(),
-                    provider: "openrouter".into(),
-                    tasks: vec!["chat".into(), "code".into(), "reasoning".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 128_000,
-                },
-                ModelConfig {
-                    id: "google/gemma-4-31b-it:free".into(),
-                    provider: "openrouter".into(),
-                    tasks: vec!["chat".into(), "analysis".into(), "reasoning".into()],
-                    tool_use: false,
-                    vision: false,
-                    ctx: 262_144,
-                },
+                // ── Groq (GROQ_API_KEY) — ultra-low latency ─────────────────────
+                // llama-3.1-8b-instant: 14,400 req/day  → fast SIMPLE fallback
+                // llama-3.3-70b:         1,000 req/day  → MEDIUM general
+                // llama-4-scout:         1,000 req/day, 30K tok/min → COMPLEX
+                mc("llama-3.1-8b-instant",             "groq", &["chat","code"],                     131_072, "simple"),
+                mc("llama-3.3-70b-versatile",          "groq", &["code","chat","analysis"],           131_072, "medium"),
+                mc("llama-4-scout-17b-16e-instruct",   "groq", &["code","reasoning","chat"],          131_072, "complex"),
+                mc("qwen/qwen3-32b",                   "groq", &["reasoning","code"],                 131_072, "reasoning"),
+
+                // ── Kilo Gateway (KILO_API_KEY) ──────────────────────────────────
+                // kilo/auto-free: Kilo's smart router — picks best free model.
+                // Previously listed as kilo-auto/free (see Kilo-Org/kilocode#6686).
+                mc("kilo/auto-free",                      "kilo", &["code","reasoning","chat","analysis"], 1_048_576, "medium"),
+                mc("nvidia/nemotron-3-super-120b-a12b:free","kilo", &["reasoning","code","chat"],         999_424,   "reasoning"),
+                mc("poolside/laguna-m.1:free",            "kilo", &["code","reasoning"],                  262_144,   "complex"),
+
+                // ── OpenRouter (OPENROUTER_API_KEY) — 50-1000 req/day ────────────
+                mc("qwen/qwen3-coder:free",                      "openrouter", &["code","reasoning","analysis"], 1_048_576, "complex"),
+                mc("deepseek/deepseek-v4-flash:free",            "openrouter", &["code","reasoning","chat"],     1_048_576, "reasoning"),
+                mc("openai/gpt-oss-120b:free",                   "openrouter", &["code","reasoning","chat","analysis"], 128_000, "complex"),
+                mc("nousresearch/hermes-3-llama-3.1-405b:free",  "openrouter", &["code","reasoning","chat","analysis"], 128_000, "complex"),
+                mc("meta-llama/llama-3.3-70b-instruct:free",     "openrouter", &["code","chat","analysis"],      131_072, "medium"),
+                mc("openai/gpt-oss-20b:free",                    "openrouter", &["chat","code","reasoning"],     128_000, "simple"),
+                mc("google/gemma-4-31b-it:free",                 "openrouter", &["chat","analysis","reasoning"], 262_144, "medium"),
+                mc("moonshotai/kimi-k2.6:free",                  "openrouter", &["reasoning","code","chat"],     262_144, "reasoning"),
             ],
         }
     }
@@ -276,88 +241,154 @@ fn expand_tilde(s: &str) -> PathBuf {
 // ─── Default config template ─────────────────────────────────────────────────
 
 /// Written to disk on first run if no config exists.
-static DEFAULT_CONFIG_TOML: &str = r#"# OMRP configuration
-# All models below are free-tier — no credits required.
+static DEFAULT_CONFIG_TOML: &str = r#"# OMRP configuration — all models are permanently free-tier.
 # API keys are read from environment variables, never stored here.
+# Set keys for the providers you want to use (you don't need all of them):
 #
-# Quick start:
-#   export KILO_API_KEY=...           # https://kilo.ai
-#   export OPENROUTER_API_KEY=...     # https://openrouter.ai/keys  (optional)
+#   export CEREBRAS_API_KEY=...     # https://cloud.cerebras.ai  (fastest, 14k req/day)
+#   export GROQ_API_KEY=...         # https://console.groq.com   (ultra-low latency)
+#   export KILO_API_KEY=...         # https://kilo.ai            (smart auto-router)
+#   export OPENROUTER_API_KEY=...   # https://openrouter.ai/keys (50-1000 req/day)
+#
 #   omrp route "write a fibonacci function in Rust"
+#   omrp serve                      # OpenAI-compat proxy on :18800
+#   omrp dashboard                  # live TUI health view
 #
-# Run `omrp dashboard` for a live TUI view of model health and routing scores.
-# Browse free models: https://openrouter.ai/models?supported_parameters=free
+# tier: simple | medium | complex | reasoning
+#   The prompt classifier picks a tier; models in that tier are tried first.
 
 [daemon]
 # Ledger file — persists health scores across restarts.
-# Defaults to ~/.local/share/omrp/ledger.jsonl
 # ledger_path = "~/.local/share/omrp/ledger.jsonl"
 
-# ─── Kilo Gateway (KILO_API_KEY) ──────────────────────────────────────────────
-# kilo-auto/free is Kilo's smart auto-router: picks the best available free
-# model on Kilo's network automatically.  Use it as your primary catch-all.
+# ─── Cerebras (CEREBRAS_API_KEY) — wafer-scale speed, 14,400 req/day ──────────
 
 [[model]]
-id       = "kilo-auto/free"
+id    = "llama3.1-8b"
+provider = "cerebras"
+tasks = ["chat", "code"]
+ctx   = 128000
+tier  = "simple"
+
+[[model]]
+id    = "gpt-oss-120b"
+provider = "cerebras"
+tasks = ["code", "reasoning", "chat", "analysis"]
+ctx   = 128000
+tier  = "complex"
+
+# ─── Groq (GROQ_API_KEY) — ultra-low latency inference ─────────────────────────
+
+[[model]]
+id    = "llama-3.1-8b-instant"
+provider = "groq"
+tasks = ["chat", "code"]
+ctx   = 131072
+tier  = "simple"
+
+[[model]]
+id    = "llama-3.3-70b-versatile"
+provider = "groq"
+tasks = ["code", "chat", "analysis"]
+ctx   = 131072
+tier  = "medium"
+
+[[model]]
+id    = "llama-4-scout-17b-16e-instruct"
+provider = "groq"
+tasks = ["code", "reasoning", "chat"]
+ctx   = 131072
+tier  = "complex"
+
+[[model]]
+id    = "qwen/qwen3-32b"
+provider = "groq"
+tasks = ["reasoning", "code"]
+ctx   = 131072
+tier  = "reasoning"
+
+# ─── Kilo Gateway (KILO_API_KEY) ────────────────────────────────────────────────
+# kilo/auto-free auto-picks the best free model on Kilo's network.
+# (Note: previously listed as kilo-auto/free — fixed per Kilo-Org/kilocode#6686)
+
+[[model]]
+id    = "kilo/auto-free"
 provider = "kilo"
-tasks    = ["code", "reasoning", "chat", "analysis"]
-ctx      = 1048576
+tasks = ["code", "reasoning", "chat", "analysis"]
+ctx   = 1048576
+tier  = "medium"
 
 [[model]]
-id       = "nvidia/nemotron-3-super-120b-a12b:free"
+id    = "nvidia/nemotron-3-super-120b-a12b:free"
 provider = "kilo"
-tasks    = ["reasoning", "code", "chat"]
-ctx      = 999424
+tasks = ["reasoning", "code", "chat"]
+ctx   = 999424
+tier  = "reasoning"
 
 [[model]]
-id       = "poolside/laguna-m.1:free"
+id    = "poolside/laguna-m.1:free"
 provider = "kilo"
-tasks    = ["code", "reasoning"]
-ctx      = 262144
+tasks = ["code", "reasoning"]
+ctx   = 262144
+tier  = "complex"
 
-# ─── OpenRouter (OPENROUTER_API_KEY) ──────────────────────────────────────────
-
-[[model]]
-id       = "qwen/qwen3-coder:free"
-provider = "openrouter"
-tasks    = ["code", "reasoning", "analysis"]
-ctx      = 1048576
+# ─── OpenRouter (OPENROUTER_API_KEY) ────────────────────────────────────────────
 
 [[model]]
-id       = "deepseek/deepseek-v4-flash:free"
+id    = "qwen/qwen3-coder:free"
 provider = "openrouter"
-tasks    = ["code", "reasoning", "chat"]
-ctx      = 1048576
+tasks = ["code", "reasoning", "analysis"]
+ctx   = 1048576
+tier  = "complex"
 
 [[model]]
-id       = "openai/gpt-oss-120b:free"
+id    = "deepseek/deepseek-v4-flash:free"
 provider = "openrouter"
-tasks    = ["code", "reasoning", "chat", "analysis"]
-ctx      = 128000
+tasks = ["code", "reasoning", "chat"]
+ctx   = 1048576
+tier  = "reasoning"
 
 [[model]]
-id       = "nousresearch/hermes-3-llama-3.1-405b:free"
+id    = "openai/gpt-oss-120b:free"
 provider = "openrouter"
-tasks    = ["code", "reasoning", "chat", "analysis"]
-ctx      = 128000
+tasks = ["code", "reasoning", "chat", "analysis"]
+ctx   = 128000
+tier  = "complex"
 
 [[model]]
-id       = "meta-llama/llama-3.3-70b-instruct:free"
+id    = "nousresearch/hermes-3-llama-3.1-405b:free"
 provider = "openrouter"
-tasks    = ["code", "chat", "analysis"]
-ctx      = 131072
+tasks = ["code", "reasoning", "chat", "analysis"]
+ctx   = 128000
+tier  = "complex"
 
 [[model]]
-id       = "openai/gpt-oss-20b:free"
+id    = "meta-llama/llama-3.3-70b-instruct:free"
 provider = "openrouter"
-tasks    = ["chat", "code", "reasoning"]
-ctx      = 128000
+tasks = ["code", "chat", "analysis"]
+ctx   = 131072
+tier  = "medium"
 
 [[model]]
-id       = "google/gemma-4-31b-it:free"
+id    = "openai/gpt-oss-20b:free"
 provider = "openrouter"
-tasks    = ["chat", "analysis", "reasoning"]
-ctx      = 262144
+tasks = ["chat", "code", "reasoning"]
+ctx   = 128000
+tier  = "simple"
+
+[[model]]
+id    = "google/gemma-4-31b-it:free"
+provider = "openrouter"
+tasks = ["chat", "analysis", "reasoning"]
+ctx   = 262144
+tier  = "medium"
+
+[[model]]
+id    = "moonshotai/kimi-k2.6:free"
+provider = "openrouter"
+tasks = ["reasoning", "code", "chat"]
+ctx   = 262144
+tier  = "reasoning"
 "#;
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -369,19 +400,30 @@ mod tests {
     #[test]
     fn test_builtin_defaults_parses_models() {
         let cfg = Config::builtin_defaults();
-        // 3 Kilo + 7 OpenRouter = 10 total, no duplicates
-        assert_eq!(cfg.model.len(), 10, "expect 10 models (3 kilo + 7 openrouter)");
+        // 2 Cerebras + 4 Groq + 3 Kilo + 8 OpenRouter = 17 total
+        assert_eq!(cfg.model.len(), 17, "got {}", cfg.model.len());
         let events = cfg.to_model_events();
-        assert_eq!(events.len(), 10);
-        // All models must be free-tier: either `:free` suffix OR `kilo-auto/*` OR provider="kilo"
-        assert!(cfg.model.iter().all(|m| {
-            m.id.ends_with(":free")
-                || m.id.starts_with("kilo-auto/")
-                || m.provider == "kilo"
-        }), "every model must be free-tier");
-        // Both providers must be present
+        assert_eq!(events.len(), 17);
+        // All models must be free-tier: either :free suffix OR kilo/auto* OR Cerebras/Groq (always free)
+        for m in &cfg.model {
+            let is_free = m.id.ends_with(":free")
+                || m.id.starts_with("kilo/auto")
+                || m.provider == "cerebras"
+                || m.provider == "groq";
+            assert!(is_free, "model {} is not free-tier", m.id);
+        }
+        // All four providers must be present
+        assert!(cfg.model.iter().any(|m| m.provider == "cerebras"));
+        assert!(cfg.model.iter().any(|m| m.provider == "groq"));
         assert!(cfg.model.iter().any(|m| m.provider == "kilo"));
         assert!(cfg.model.iter().any(|m| m.provider == "openrouter"));
+        // Kilo slug fixed (Kilo-Org/kilocode#6686)
+        assert!(cfg.model.iter().any(|m| m.id == "kilo/auto-free"),
+            "kilo/auto-free must be present (not kilo-auto/free)");
+        assert!(!cfg.model.iter().any(|m| m.id == "kilo-auto/free"),
+            "stale kilo-auto/free slug must not be present");
+        // All models must have tier assigned
+        assert!(cfg.model.iter().all(|m| !m.tier.is_empty()));
     }
 
     #[test]
@@ -394,11 +436,14 @@ mod tests {
     #[test]
     fn test_model_capabilities_set_correctly() {
         let cfg = Config::builtin_defaults();
-        let kilo_auto = cfg.model.iter().find(|m| m.id == "kilo-auto/free").unwrap();
-        let model = kilo_auto.to_model();
+        let kilo = cfg.model.iter().find(|m| m.id == "kilo/auto-free").unwrap();
+        let model = kilo.to_model();
         assert_eq!(model.provider, "kilo");
         assert_eq!(model.capabilities.context_window, 1_048_576);
         assert!(model.capabilities.task_suitability.contains(&TaskType::Code));
+        // Cerebras is present
+        let cerberas = cfg.model.iter().find(|m| m.provider == "cerebras").unwrap();
+        assert_eq!(cerberas.tier, "simple");
     }
 
     #[test]
