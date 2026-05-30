@@ -4,6 +4,7 @@ members = [
     "crates/omrp-types",
     "crates/omrp-events",
     "crates/omrp-core",
+    "crates/omrp-runtime",
 ]
 
 [workspace.package]

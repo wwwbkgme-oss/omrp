@@ -1,0 +1,15 @@
+[package]
+name = "omrp-runtime"
+version.workspace = true
+edition.workspace = true
+description = "OMRP CLI — deterministic LLM routing engine"
+
+[[bin]]
+name = "omrp"
+path = "src/main.rs"
+
+[dependencies]
+omrp-types  = { path = "../omrp-types" }
+omrp-events = { path = "../omrp-events" }
+omrp-core   = { path = "../omrp-core" }
+serde_json.workspace = true
