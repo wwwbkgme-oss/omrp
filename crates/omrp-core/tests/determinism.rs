@@ -64,8 +64,6 @@ fn test_idempotent_model_add() {
 
 #[test]
 fn test_determinism_fuzz() {
-    use omrp_types::model::ModelCapabilities;
-    use omrp_types::task::TaskType;
     use omrp_events::event::{Event, ModelSource};
 
     let models = vec![
