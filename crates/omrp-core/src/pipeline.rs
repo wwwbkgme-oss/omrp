@@ -98,6 +98,39 @@ impl EventPipeline {
         let replayed = self.replay();
         live == replayed
     }
+
+    // ── Persistence ───────────────────────────────────────────────────────
+
+    /// Load a pipeline from an existing ledger file, replaying all events to
+    /// reconstruct `State`.  If the file does not exist an empty pipeline is
+    /// returned (first-run case).
+    ///
+    /// Stored events bypass validation: they were already validated when first
+    /// processed, and re-validating would reject semantically valid history
+    /// (e.g. zero-latency seed events used in tests).
+    pub fn load_from_ledger(path: &std::path::Path) -> Result<Self, crate::ledger::LedgerError> {
+        let ledger = crate::ledger::LedgerStore::load(path.to_path_buf())?;
+        let events = ledger.replay();
+        let mut pipeline = Self::new();
+        for event in events {
+            // Bypass validation — apply directly.
+            pipeline.state.write(|state| dispatch(state, &event));
+            pipeline.event_log.push(event);
+        }
+        Ok(pipeline)
+    }
+
+    /// Persist the current event log to a `LedgerStore` (JSON Lines file).
+    ///
+    /// Creates parent directories automatically.  On every call the file is
+    /// rewritten from scratch (Phase 2 design; segmented append comes later).
+    pub fn save_to_ledger(&self, path: &std::path::Path) -> Result<(), crate::ledger::LedgerError> {
+        let mut store = crate::ledger::LedgerStore::new(path.to_path_buf());
+        for event in &self.event_log {
+            store.append(event.clone());
+        }
+        store.persist()
+    }
 }
 
 #[cfg(test)]
