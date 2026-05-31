@@ -141,7 +141,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/stats",              get(admin_stats))
         .route("/api/admin/audit-logs",         get(admin_audit_logs))
         .route("/api/admin/proxies",              get(admin_list_proxies).post(admin_add_proxy))
-        .route("/api/admin/proxies/:id",          delete(admin_delete_proxy))
+        .route("/api/admin/proxies/:id",          delete(admin_delete_proxy).put(admin_update_proxy_status))
         .route("/api/admin/proxies/:id/activate", post(admin_activate_proxy))
         .route("/api/admin/proxies/refresh",      post(admin_refresh_proxies))
         // ── Admin: model health + routing intelligence ─────────────────────────
@@ -983,6 +983,29 @@ async fn admin_activate_proxy(
 ) -> Response {
     if let Some(e) = require_admin(&user) { return e; }
     match state.db.activate_proxy(id) {
+        Ok(true)  => { state.proxy_pool.load(&state.db); ok(json!({"status":"ok"})) }
+        Ok(false) => err(StatusCode::NOT_FOUND, "proxy not found"),
+        Err(e)    => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateProxyStatusRequest { is_active: Option<bool> }
+
+/// `PUT /api/admin/proxies/:id` — activate or deactivate a proxy.
+async fn admin_update_proxy_status(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Path(id): Path<i64>, Json(req): Json<UpdateProxyStatusRequest>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    let result = if req.is_active.unwrap_or(true) {
+        state.db.activate_proxy(id)
+    } else {
+        // Deactivate: mark fail_count=5 which excludes from active pool
+        let conn_result = state.db.deactivate_proxy(id);
+        conn_result
+    };
+    match result {
         Ok(true)  => { state.proxy_pool.load(&state.db); ok(json!({"status":"ok"})) }
         Ok(false) => err(StatusCode::NOT_FOUND, "proxy not found"),
         Err(e)    => err(StatusCode::INTERNAL_SERVER_ERROR, e),

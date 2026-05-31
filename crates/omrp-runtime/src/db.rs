@@ -1097,6 +1097,15 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Deactivate a proxy (set fail_count high so it's excluded from the pool).
+    pub fn deactivate_proxy(&self, id: i64) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE proxies SET is_active=0, fail_count=5 WHERE id=?1", params![id]
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn proxy_count(&self) -> SqlResult<i64> {
         let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM proxies WHERE is_active=1", [], |r| r.get(0))
