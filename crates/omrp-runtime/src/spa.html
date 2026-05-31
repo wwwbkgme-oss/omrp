@@ -1553,135 +1553,279 @@ async function renderLogs(ca) {
     </div></div></div>`;
 }
 
+// ─── Proxy Excel grid ─────────────────────────────────────────────────────────
+let _proxSort = {col:'id',dir:1};
+
 async function renderProxies(ca) {
   const [{data:proxies=[]}, {data:settings=[]}, proxyStats] = await Promise.all([
     GET('/api/admin/proxies'),
     GET('/api/admin/settings'),
     GET('/api/admin/proxies/stats'),
   ]);
-  const sv = k => (settings.find(s=>s.key===k)||{}).value || '';
-  const enabled  = sv('proxy.enabled') === '1';
+  const sv = k => (settings.find(s=>s.key===k)||{}).value||'';
+  const enabled  = sv('proxy.enabled')==='1';
   const srcUrl   = sv('proxy.source_url');
-  const interval = sv('proxy.refresh_interval') || '3600';
-  const usageStats = proxyStats.proxies || [];
+  const interval = sv('proxy.refresh_interval')||'3600';
+  const usageStats = proxyStats.proxies||[];
+
+  const active = proxies.filter(p=>p.is_active).length;
+  const slow   = proxies.filter(p=>p.latency_ms&&p.latency_ms>2000).length;
+
+  const PRESETS = [
+    {label:'ProxyScrape (HTTP+SOCKS4+SOCKS5)',url:'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json'},
+    {label:'ProxyScrape SOCKS5 only',url:'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=socks5'},
+    {label:'GeoNode fast list',url:'https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http,https,socks4,socks5&speed=fast'},
+  ];
 
   ca.innerHTML = `
-    <!-- ── Status banner ── -->
-    <div style="background:${enabled?'var(--green-dim)':'var(--bg2)'};border:1px solid ${enabled?'var(--green)40':'var(--border)'};border-radius:var(--r8);padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:14px">
-      <div style="font-size:22px">${enabled?'⊛':'○'}</div>
-      <div style="flex:1">
-        <div style="font-weight:700;font-size:14px;color:${enabled?'var(--green)':'var(--text1)'}">
-          Proxy Rate-Limit Bypass — ${enabled?'ENABLED':'DISABLED'}
-        </div>
-        <div style="font-size:12px;color:var(--text2);margin-top:3px">
-          ${enabled
-            ? `Active — ${proxies.length} proxies in pool. Users with bypass enabled are automatically routed through proxy IPs — they never hit rate limits.`
-            : 'Disabled. Enable to allow users with bypass permission to avoid per-IP rate limits.'}
-        </div>
-      </div>
-      <button class="btn ${enabled?'btn-danger':'btn-primary'}" onclick="toggleProxy(${enabled})" style="white-space:nowrap">
-        ${enabled?'Disable':'Enable'}
+    <!-- toolbar -->
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px">
+      <button class="btn ${enabled?'btn-danger':'btn-primary'}" style="min-width:110px" onclick="toggleProxy(${enabled})">
+        ${enabled?'⏸ Disable bypass':'▶ Enable bypass'}
       </button>
+      <button class="btn btn-secondary" onclick="refreshProxies()" id="btn-prx-refresh">⟳ Fetch from source</button>
+      <button class="btn btn-ghost" onclick="proxyAddRow()" style="font-size:12px">＋ Add proxy</button>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <input id="prx-search" class="form-input" placeholder="Filter URL / country…"
+          style="width:180px;padding:5px 8px;font-size:12px" oninput="renderProxyGrid()">
+        <span style="font-size:12px;color:var(--text2);white-space:nowrap">
+          ${proxies.length} rows · ${active} active
+        </span>
+      </div>
     </div>
 
-    <!-- ── How it works ── -->
-    <div class="card" style="margin-bottom:16px">
-      <div class="card-header"><div class="card-title">How rate-limit bypass works</div></div>
-      <div class="card-body" style="font-size:12px;color:var(--text1);line-height:1.7">
-        Free LLM providers enforce <strong>per-IP quotas</strong>.<br>
-        Users with <em>Proxy Bypass</em> enabled in their API key permissions are automatically routed through a pool of proxy IPs — every request appears to come from a different IP:<br>
-        <div style="margin:10px 0;padding:10px;background:var(--bg3);border-radius:var(--r4);font-family:var(--mono);font-size:11px">
-          User → OMRP → proxy pool[0] (1.2.3.4) → provider → ✓ 200<br>
-          User → OMRP → proxy pool[1] (5.6.7.8) → provider → ✓ 200<br>
-          User → OMRP → proxy pool[2] (9.0.1.2) → provider → ✓ 200
+    <!-- status strip -->
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <span style="padding:5px 12px;border-radius:var(--r6);font-size:12px;font-weight:600;
+        background:${enabled?'var(--green-dim)':'var(--bg2)'};color:${enabled?'var(--green)':'var(--text2)'};
+        border:1px solid ${enabled?'var(--green)40':'var(--border)'}">
+        ${enabled?'⊛ BYPASS ACTIVE':'○ bypass off'}
+      </span>
+      <span style="padding:5px 12px;border-radius:var(--r6);font-size:12px;background:var(--bg2);
+        color:var(--text2);border:1px solid var(--border)">
+        🟢 ${active} active &nbsp;🔴 ${proxies.filter(p=>!p.is_active).length} off &nbsp;🟡 ${slow} slow
+      </span>
+      <span style="padding:5px 12px;border-radius:var(--r6);font-size:12px;background:var(--bg2);
+        color:var(--text2);border:1px solid var(--border)">
+        1h: ${proxyStats.requests_1h||0} &nbsp; 24h: ${proxyStats.requests_24h||0} requests
+      </span>
+    </div>
+
+    <!-- fetch sources -->
+    <details class="card" style="margin-bottom:10px">
+      <summary style="padding:10px 14px;cursor:pointer;font-size:13px;font-weight:600;color:var(--text1);
+        list-style:none;display:flex;align-items:center;gap:6px">
+        ⬇ Fetch sources
+        <span style="font-size:11px;color:var(--text2);font-weight:400">— click to expand</span>
+      </summary>
+      <div class="card-body" style="padding:12px;border-top:1px solid var(--border)">
+        <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+          <input id="proxy-src-url" class="form-input" value="${esc(srcUrl)}"
+            placeholder="https://…" style="flex:1;min-width:240px">
+          <input id="proxy-interval" class="form-input" value="${esc(interval)}"
+            placeholder="3600" style="width:80px" title="Refresh interval (s)">
+          <button class="btn btn-secondary" onclick="
+            Promise.all([
+              saveSettingVal('proxy.source_url', document.getElementById('proxy-src-url').value),
+              saveSettingVal('proxy.refresh_interval', document.getElementById('proxy-interval').value)
+            ]).then(()=>toast('Saved'))">Save</button>
         </div>
-        Admin controls who gets bypass access via <strong>Users → click user → API Key Permissions → Proxy Bypass</strong>.
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Preset</th><th>URL preview</th><th style="width:60px"></th></tr></thead>
+          <tbody>${PRESETS.map(p=>`<tr>
+            <td style="font-size:12px;white-space:nowrap">${esc(p.label)}</td>
+            <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${esc(p.url.slice(0,70))}…</td>
+            <td><button class="btn btn-ghost" style="font-size:11px;padding:3px 8px"
+              onclick="(async()=>{
+                document.getElementById('proxy-src-url').value='${esc(p.url)}';
+                await saveSettingVal('proxy.source_url','${esc(p.url)}');
+                toast('Source saved');
+              })()">Use</button></td>
+          </tr>`).join('')}</tbody>
+        </table></div>
       </div>
-    </div>
+    </details>
 
-    <!-- ── Stats ── -->
-    <div class="stats-grid" style="margin-bottom:16px">
-      <div class="stat-card ${enabled?'green':''}">
-        <span class="stat-icon">⊛</span>
-        <div class="stat-value">${proxies.length}</div><div class="stat-label">Active Proxies</div>
-      </div>
-      <div class="stat-card">
-        <span class="stat-icon">⏱</span>
-        <div class="stat-value">${Math.round(parseInt(interval)/60)}m</div><div class="stat-label">Auto-refresh</div>
-      </div>
-      <div class="stat-card blue">
-        <span class="stat-icon">∿</span>
-        <div class="stat-value">${proxyStats.requests_1h||0}</div><div class="stat-label">Requests (1h)</div>
-      </div>
-      <div class="stat-card cyan">
-        <span class="stat-icon">∿</span>
-        <div class="stat-value">${proxyStats.requests_24h||0}</div><div class="stat-label">Requests (24h)</div>
-      </div>
-    </div>
-
-    <!-- ── Settings ── -->
-    <div class="card" style="margin-bottom:16px">
-      <div class="card-header"><div class="card-title">Settings</div></div>
-      <div class="card-body">
-        <div style="margin-bottom:14px">
-          <div class="form-label">Source URL</div>
-          <div class="keys-row" style="margin-top:6px">
-            <input id="proxy-src-url" class="form-input" value="${esc(srcUrl)}" placeholder="https://api.proxyscrape.com/...">
-            <button class="btn btn-secondary" onclick="saveSettingVal('proxy.source_url',document.getElementById('proxy-src-url').value)">Save</button>
-          </div>
+    <!-- Excel grid -->
+    <div class="card">
+      <div class="card-body" style="padding:0">
+        <div style="overflow:auto;max-height:55vh">
+          <table id="prx-grid" style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead>
+              <tr style="position:sticky;top:0;z-index:2;background:var(--bg3)">
+                <th style="width:30px;padding:6px 6px 6px 10px;border-bottom:2px solid var(--border)">
+                  <input type="checkbox" id="prx-sel-all" onchange="proxyToggleAll(this.checked)">
+                </th>
+                ${[['id','#',40],['protocol','Proto',58],['url','Proxy URL',0],['country','CC',46],
+                   ['latency_ms','Ping',60],['uptime_pct','Up%',58],['fail_count','Fails',46],
+                   ['is_active','Status',70],['last_check','Last check',100]
+                ].map(([col,label,w])=>`
+                  <th onclick="proxySortBy('${col}')" style="padding:6px 8px;border-bottom:2px solid var(--border);
+                    cursor:pointer;white-space:nowrap;text-align:left;${w?'width:'+w+'px':''}">
+                    ${label}<span id="prx-sort-${col}" style="color:var(--accent);margin-left:2px"></span>
+                  </th>`).join('')}
+                <th style="width:80px;padding:6px 8px;border-bottom:2px solid var(--border)">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="prx-tbody"></tbody>
+          </table>
         </div>
-        <div>
-          <div class="form-label">Auto-refresh interval (seconds)</div>
-          <div class="keys-row" style="margin-top:6px">
-            <input id="proxy-interval" class="form-input" value="${esc(interval)}" placeholder="3600" style="max-width:120px">
-            <button class="btn btn-secondary" onclick="saveSettingVal('proxy.refresh_interval',document.getElementById('proxy-interval').value)">Save</button>
-          </div>
+        <!-- add row -->
+        <div id="prx-add-row" style="display:none;padding:8px 10px;border-top:1px solid var(--border);background:var(--bg3);gap:8px;flex-wrap:wrap;align-items:center">
+          <span style="font-size:12px;color:var(--text2);white-space:nowrap">Add:</span>
+          <input id="prx-add-url" class="form-input" placeholder="http://ip:port or socks5://ip:port"
+            style="flex:1;min-width:200px;padding:5px 8px;font-size:12px">
+          <button class="btn btn-primary" style="padding:5px 14px;font-size:12px" onclick="proxyAddSubmit()">Add</button>
+          <button class="btn btn-ghost" style="padding:5px 10px;font-size:12px"
+            onclick="document.getElementById('prx-add-row').style.display='none'">✕</button>
+        </div>
+        <div style="padding:5px 12px;border-top:1px solid var(--border);font-size:11px;
+          color:var(--text2);display:flex;justify-content:space-between">
+          <span id="prx-sel-count">0 selected</span>
+          <span id="prx-row-count"></span>
         </div>
       </div>
     </div>
 
-    <!-- ── Actions ── -->
-    <div style="display:flex;gap:10px;margin-bottom:16px">
-      <button class="btn btn-primary" onclick="refreshProxies()">⟳ Refresh Pool Now</button>
-    </div>
-
-    <!-- ── Usage Stats ── -->
-    ${usageStats.length ? `
-    <div class="card" style="margin-bottom:16px">
-      <div class="card-header"><div class="card-title">Proxy Usage Statistics</div>
-        <div style="font-size:11px;color:var(--text2)">All-time per-proxy request counts</div>
-      </div>
+    <!-- usage stats -->
+    ${usageStats.length?`
+    <div class="card" style="margin-top:14px">
+      <div class="card-header"><div class="card-title">Usage per proxy (all-time)</div></div>
       <div class="card-body" style="padding:0"><div class="tbl-wrap"><table>
-        <thead><tr><th>Proxy URL</th><th style="text-align:right">Total</th><th style="text-align:right">Success</th><th style="text-align:right">Errors</th><th style="text-align:right">Success%</th><th>Unique Users</th><th>Last Used</th></tr></thead>
+        <thead><tr><th>URL</th><th style="text-align:right">Total</th><th style="text-align:right;color:var(--green)">OK</th>
+          <th style="text-align:right;color:var(--red)">Err</th><th style="width:90px">OK %</th><th>Users</th><th>Last</th></tr></thead>
         <tbody>${usageStats.map(p=>`<tr>
           <td><span class="mono" style="font-size:11px">${esc(p.url)}</span></td>
           <td style="text-align:right;font-family:var(--mono)">${p.total}</td>
           <td style="text-align:right;font-family:var(--mono);color:var(--green)">${p.ok}</td>
           <td style="text-align:right;font-family:var(--mono);color:${p.err>0?'var(--red)':'var(--text2)'}">${p.err}</td>
-          <td style="text-align:right">
-            <span style="color:${p.success_pct>=90?'var(--green)':p.success_pct>=70?'var(--orange)':'var(--red)'}">
-              ${p.success_pct}%
-            </span>
+          <td>
+            <div style="display:flex;align-items:center;gap:5px">
+              <div style="flex:1;height:4px;border-radius:2px;background:var(--bg3);overflow:hidden">
+                <div style="width:${Math.min(100,p.success_pct)}%;height:100%;background:${p.success_pct>=80?'var(--green)':p.success_pct>=50?'var(--orange)':'var(--red)'}"></div>
+              </div>
+              <span style="font-size:10px;color:${p.success_pct>=80?'var(--green)':p.success_pct>=50?'var(--orange)':'var(--red)'}">${p.success_pct}%</span>
+            </div>
           </td>
-          <td style="color:var(--text2);font-size:12px">${p.users}</td>
-          <td style="color:var(--text2);font-size:12px">${fmtDatetime(p.last_used)}</td>
+          <td style="font-size:11px;color:var(--text2)">${p.users}</td>
+          <td style="font-size:11px;color:var(--text3);white-space:nowrap">${fmtDatetime(p.last_used)}</td>
         </tr>`).join('')}</tbody>
       </table></div></div>
-    </div>` : ''}
+    </div>`:''}`;
 
-    <!-- ── Pool list ── -->
-    <div class="card"><div class="card-body" style="padding:0"><div class="tbl-wrap">
-    <table>
-      <thead><tr><th>#</th><th>URL</th></tr></thead>
-      <tbody>${proxies.length ? proxies.slice(0,100).map((p,i)=>`<tr>
-        <td style="color:var(--text2);font-size:12px">${p.id}</td>
-        <td><span class="mono" style="font-size:12px">${esc(p.url)}</span></td>
-      </tr>`).join('') : `<tr><td colspan="2"><div class="empty"><div class="empty-icon">⊛</div><div class="empty-title">No proxies in pool</div>
-        <div class="empty-sub">${enabled?'Click "Refresh Pool Now" to fetch proxies.':'Enable proxy rotation above first.'}</div></div></td></tr>`}
-      ${proxies.length>100?`<tr><td colspan="2" style="text-align:center;color:var(--text2);padding:12px;font-size:12px">…and ${proxies.length-100} more</td></tr>`:''}
-      </tbody>
-    </table>
-    </div></div></div>`;
+  window._proxyData  = proxies;
+  window._proxyUsage = {};
+  for (const u of usageStats) window._proxyUsage[u.url]=u;
+  renderProxyGrid();
+}
+
+function renderProxyGrid() {
+  const rows = window._proxyData||[];
+  const q    = (document.getElementById('prx-search')?.value||'').toLowerCase();
+  const {col,dir} = _proxSort;
+
+  let filtered = q
+    ? rows.filter(p=>(p.url||'').toLowerCase().includes(q)||(p.country||'').toLowerCase().includes(q)||(p.protocol||'').toLowerCase().includes(q))
+    : rows;
+
+  filtered = [...filtered].sort((a,b)=>{
+    let av=a[col], bv=b[col];
+    if (av==null) av=col==='latency_ms'?99999:'';
+    if (bv==null) bv=col==='latency_ms'?99999:'';
+    return typeof av==='string' ? dir*av.localeCompare(bv) : dir*(av-bv);
+  });
+
+  document.querySelectorAll('[id^=prx-sort-]').forEach(el=>el.textContent='');
+  const si=document.getElementById('prx-sort-'+col); if(si) si.textContent=dir===1?' ▲':' ▼';
+
+  const tbody=document.getElementById('prx-tbody');
+  if(!tbody) return;
+  tbody.innerHTML = filtered.length ? filtered.map((p,i)=>{
+    const lat=p.latency_ms;
+    const latCl=lat==null?'var(--text2)':lat<500?'var(--green)':lat<2000?'var(--orange)':'var(--red)';
+    const upt=p.uptime_pct??100;
+    const uptCl=upt>=90?'var(--green)':upt>=60?'var(--orange)':'var(--red)';
+    const rowBg=i%2===0?'var(--bg1)':'var(--bg2)';
+    return `<tr style="background:${rowBg};border-bottom:1px solid var(--border)22"
+      onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background='${rowBg}'">
+      <td style="padding:4px 6px 4px 10px;text-align:center"><input type="checkbox" class="prx-cb" data-id="${p.id}" onchange="proxySelChange()"></td>
+      <td style="padding:4px 8px;color:var(--text3);font-family:var(--mono);font-size:11px">${p.id}</td>
+      <td style="padding:4px 8px"><span style="font-size:10px;padding:2px 5px;border-radius:3px;background:var(--bg3);color:var(--text2);font-family:var(--mono)">${esc(p.protocol||'http')}</span></td>
+      <td style="padding:4px 8px;font-family:var(--mono);font-size:11px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.url)}">${esc(p.url)}</td>
+      <td style="padding:4px 8px;font-size:11px;color:var(--text2);text-align:center">${p.country?esc(p.country.slice(0,3).toUpperCase()):'—'}</td>
+      <td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:${latCl};text-align:right">${lat!=null?lat+'ms':'—'}</td>
+      <td style="padding:4px 8px">
+        <div style="display:flex;align-items:center;gap:4px;justify-content:flex-end">
+          <div style="width:28px;height:4px;border-radius:2px;background:var(--bg4)">
+            <div style="width:${Math.min(100,upt)}%;height:100%;background:${uptCl};border-radius:2px"></div>
+          </div>
+          <span style="font-size:10px;color:${uptCl};font-family:var(--mono)">${upt}%</span>
+        </div>
+      </td>
+      <td style="padding:4px 8px;text-align:center;font-family:var(--mono);font-size:11px;color:${p.fail_count>=5?'var(--red)':p.fail_count>0?'var(--orange)':'var(--text2)'}">${p.fail_count}</td>
+      <td style="padding:4px 8px;text-align:center">
+        ${p.is_active
+          ?'<span style="font-size:10px;padding:2px 7px;border-radius:10px;background:var(--green)22;color:var(--green);font-weight:600">✓ active</span>'
+          :'<span style="font-size:10px;padding:2px 7px;border-radius:10px;background:var(--red)18;color:var(--red)">✗ off</span>'}
+      </td>
+      <td style="padding:4px 8px;font-size:10px;color:var(--text3);white-space:nowrap">${p.last_check?fmtDatetime(p.last_check):'—'}</td>
+      <td style="padding:4px 6px;white-space:nowrap">
+        ${p.is_active
+          ?`<button class="btn btn-ghost" style="padding:2px 6px;font-size:11px;color:var(--orange)" onclick="proxyDeactivate(${p.id})" title="Deactivate">⏸</button>`
+          :`<button class="btn btn-ghost" style="padding:2px 6px;font-size:11px;color:var(--green)" onclick="proxyActivate(${p.id})" title="Activate">▶</button>`}
+        <button class="btn btn-ghost" style="padding:2px 6px;font-size:11px;color:var(--red)" onclick="proxyDelete(${p.id})" title="Delete">🗑</button>
+      </td>
+    </tr>`;
+  }).join('')
+  :`<tr><td colspan="11"><div class="empty"><div class="empty-icon">⊛</div>
+    <div class="empty-title">No proxies</div>
+    <div class="empty-sub">${q?'No match for filter':'Click ⟳ Fetch or + Add to populate the pool.'}</div>
+  </div></td></tr>`;
+
+  const cnt=document.getElementById('prx-row-count'); if(cnt) cnt.textContent=`${filtered.length}/${rows.length} rows`;
+  proxySelChange();
+}
+
+function proxySortBy(col){
+  _proxSort=_proxSort.col===col?{col,dir:-_proxSort.dir}:{col,dir:1};
+  renderProxyGrid();
+}
+function proxyToggleAll(checked){document.querySelectorAll('.prx-cb').forEach(c=>c.checked=checked);proxySelChange();}
+function proxySelChange(){
+  const n=document.querySelectorAll('.prx-cb:checked').length;
+  const el=document.getElementById('prx-sel-count'); if(el) el.textContent=n>0?`${n} selected`:'0 selected';
+}
+function proxyAddRow(){
+  const r=document.getElementById('prx-add-row');
+  if(r){r.style.display='flex';document.getElementById('prx-add-url').focus();}
+}
+async function proxyAddSubmit(){
+  const url=(document.getElementById('prx-add-url')||{}).value?.trim();
+  if(!url){toast('URL required','err');return;}
+  const r=await POST('/api/admin/proxies',{url});
+  if(r.error){toast(r.error.message,'err');return;}
+  toast('Proxy added');
+  document.getElementById('prx-add-row').style.display='none';
+  await renderProxies(document.getElementById('content-area'));
+}
+async function proxyDelete(id){
+  if(!confirm('Delete this proxy?')) return;
+  const r=await DEL(`/api/admin/proxies/${id}`);
+  if(r.error){toast(r.error.message,'err');return;}
+  window._proxyData=(window._proxyData||[]).filter(p=>p.id!==id);
+  renderProxyGrid(); toast('Deleted');
+}
+async function proxyDeactivate(id){
+  const r=await PUT(`/api/admin/proxies/${id}`,{is_active:false});
+  if(r.error){toast(r.error.message,'err');return;}
+  const p=(window._proxyData||[]).find(x=>x.id===id); if(p){p.is_active=false;p.fail_count=5;}
+  renderProxyGrid();
+}
+async function proxyActivate(id){
+  const r=await api('POST',`/api/admin/proxies/${id}/activate`);
+  if(r.error){toast(r.error.message,'err');return;}
+  const p=(window._proxyData||[]).find(x=>x.id===id); if(p){p.is_active=true;p.fail_count=0;}
+  renderProxyGrid(); toast('Re-activated');
 }
 
 async function toggleProxy(currentlyEnabled) {
