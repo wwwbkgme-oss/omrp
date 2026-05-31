@@ -385,6 +385,17 @@ function loadBtn(id, label='…') {
   return () => { el.disabled = false; el.innerHTML = orig; };
 }
 
+// ── Async action guard ─────────────────────────────────────────────
+// Prevents double-submit on any named async action.
+// Usage: if (!beginAction('createUser')) return; ... endAction('createUser');
+const _actions = new Set();
+function beginAction(name) {
+  if (_actions.has(name)) return false;
+  _actions.add(name);
+  return true;
+}
+function endAction(name) { _actions.delete(name); }
+
 // ── Toast ──────────────────────────────────────────────────────────
 function toast(msg, type='ok', ms=3000) {
   const el = document.createElement('div');
@@ -1002,12 +1013,14 @@ function showCreateUser() {
 }
 
 async function createUser() {
+  if (!beginAction('createUser')) return;
   const r = await POST('/api/admin/users', {
     username:     document.getElementById('m-user').value.trim(),
     password:     document.getElementById('m-pass').value,
     display_name: document.getElementById('m-name').value.trim()||undefined,
     is_admin:     document.getElementById('m-role').value === '1',
   });
+  endAction('createUser');
   if (r.error) { toast(r.error.message,'err'); return; }
 
   // If bypass requested, update permissions
@@ -1728,22 +1741,26 @@ async function renderMyProfile(ca) {
 }
 
 async function saveProfile() {
+  if (!beginAction('saveProfile')) return;
   const body = {};
   const dn = document.getElementById('p-dname')?.value.trim();
   const em = document.getElementById('p-email')?.value.trim();
   if (dn !== undefined) body.display_name = dn;
   if (em !== undefined) body.email = em || null;
   const r = await PUT('/api/user/me', body);
+  endAction('saveProfile');
   if (r.error) toast(r.error.message,'err');
   else { toast('Profile saved'); nav('my-profile'); }
 }
 
 async function changePassword() {
+  if (!beginAction('changePassword')) return;
   const p1 = document.getElementById('p-pw1').value;
   const p2 = document.getElementById('p-pw2').value;
-  if (p1.length < 8) { toast('Password ≥ 8 chars required','err'); return; }
-  if (p1 !== p2) { toast('Passwords do not match','err'); return; }
+  if (p1.length < 8) { endAction('changePassword'); toast('Password ≥ 8 chars required','err'); return; }
+  if (p1 !== p2)     { endAction('changePassword'); toast('Passwords do not match','err'); return; }
   const r = await PUT('/api/user/me', { password: p1 });
+  endAction('changePassword');
   if (r.error) toast(r.error.message,'err');
   else {
     toast('Password updated');
@@ -1809,12 +1826,17 @@ function renderSetupStep() {
 }
 
 async function setupNext0() {
+  if (!beginAction('setupNext0')) return;
   const user = document.getElementById('s-user').value.trim();
   const pass = document.getElementById('s-pass').value;
   const name = document.getElementById('s-name').value.trim();
   const err  = document.getElementById('s-err');
-  if (!user || pass.length < 8) { err.style.display='block'; err.textContent='Username required, password ≥ 8 chars'; return; }
+  if (!user || pass.length < 8) {
+    endAction('setupNext0');
+    err.style.display='block'; err.textContent='Username required, password ≥ 8 chars'; return;
+  }
   const r = await POST('/api/setup', { username:user, password:pass, display_name:name||undefined });
+  endAction('setupNext0');
   if (r.error) { err.style.display='block'; err.textContent=r.error.message; return; }
   setupData.username    = user;
   setupData.password    = pass;

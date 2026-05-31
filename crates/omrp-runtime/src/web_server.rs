@@ -276,7 +276,36 @@ pub async fn run(cfg: Config, host: &str, port: u16) {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| { eprintln!("Cannot bind {addr}: {e}"); std::process::exit(1); });
-    axum::serve(listener, app).await.unwrap();
+
+    eprintln!("[omrp] listening on {addr}");
+
+    // Graceful shutdown: wait for SIGTERM or SIGINT before draining connections.
+    // axum::serve.with_graceful_shutdown() waits for in-flight requests to finish.
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate())
+                .expect("Cannot install SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt())
+                .expect("Cannot install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => eprintln!("[omrp] SIGTERM received, shutting down…"),
+                _ = sigint.recv()  => eprintln!("[omrp] SIGINT received, shutting down…"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+            eprintln!("[omrp] Ctrl-C received, shutting down…");
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .unwrap_or_else(|e| eprintln!("[omrp] serve error: {e}"));
+    eprintln!("[omrp] shutdown complete.");
 }
 
 // ─── SPA (cyberpunk enterprise dashboard) ─────────────────────────────────────
