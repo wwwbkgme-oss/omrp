@@ -252,6 +252,7 @@ tbody td{padding:10px 14px;font-size:13px;color:var(--text1);vertical-align:midd
       <div class="step-dot" id="sdot0"></div>
       <div class="step-dot" id="sdot1"></div>
       <div class="step-dot" id="sdot2"></div>
+      <div class="step-dot" id="sdot3"></div>
     </div>
     <div id="setup-body"></div>
   </div>
@@ -773,8 +774,7 @@ async function renderRoutingIntel(ca) {
     </div>`}`;
 }
 
-// ─── Users (with stats + click detail) ───────────────────────────────────────
-}
+// ─── Users (with stats + click detail + permissions) ─────────────────────────
 
 function makeChart(daily) {
   if (!daily.length) return '<div class="empty" style="padding:20px"><div class="empty-sub">No data yet</div></div>';
@@ -792,57 +792,185 @@ async function renderUsers(ca) {
   const {data:users=[]} = await GET('/api/admin/users');
   ca.innerHTML = `
     <div class="section-header">
-      <div><div class="section-title">Users</div><div class="section-sub">${users.length} account(s)</div></div>
+      <div><div class="section-title">Users</div><div class="section-sub">${users.length} account(s) · click any row for details</div></div>
       <button class="btn btn-primary" onclick="showCreateUser()">+ Create User</button>
     </div>
     <div class="card"><div class="card-body" style="padding:0"><div class="tbl-wrap">
     <table>
-      <thead><tr><th>Username</th><th>Display Name</th><th>Role</th><th>Status</th><th>Last Login</th><th>Created</th><th></th></tr></thead>
-      <tbody>${users.map(u=>`<tr>
-        <td><span class="mono">${esc(u.username)}</span></td>
-        <td>${esc(u.display_name||'—')}</td>
-        <td>${u.is_admin?'<span class="badge badge-purple">admin</span>':'<span class="badge badge-blue">user</span>'}</td>
-        <td>${yesno(u.is_active)}</td>
-        <td style="color:var(--text2);font-size:12px">${fmtDatetime(u.last_login)}</td>
-        <td style="color:var(--text2);font-size:12px">${fmtDate(u.created_at)}</td>
-        <td><div class="tbl-actions">
-          <button class="btn btn-ghost" style="padding:4px 8px;font-size:11px" onclick="showToggleUser('${u.id}',${u.is_active})">
-            ${u.is_active?'Disable':'Enable'}
-          </button>
-          <button class="btn btn-danger" style="padding:4px 8px;font-size:11px" onclick="deleteUser('${u.id}','${esc(u.username)}')">Del</button>
-        </div></td>
-      </tr>`).join('')}
+      <thead><tr>
+        <th>Username</th><th>Display Name</th><th>Role</th>
+        <th title="Proxy bypass permission">Proxy Bypass</th>
+        <th title="Router access permitted">Router</th>
+        <th>Status</th><th>Last Login</th><th>Created</th><th></th>
+      </tr></thead>
+      <tbody>
+      ${users.map(u=>`
+        <tr style="cursor:pointer" onclick="showUserDetail('${u.id}','${esc(u.username)}')">
+          <td><span class="mono">${esc(u.username)}</span></td>
+          <td style="color:var(--text2)">${esc(u.display_name||'—')}</td>
+          <td>${u.is_admin?'<span class="badge badge-purple">admin</span>':'<span class="badge badge-blue">user</span>'}</td>
+          <td id="ubp-${u.id}"><span class="badge badge-gray" style="font-size:10px">…</span></td>
+          <td id="urt-${u.id}"><span class="badge badge-gray" style="font-size:10px">…</span></td>
+          <td>${yesno(u.is_active)}</td>
+          <td style="color:var(--text2);font-size:12px">${fmtDatetime(u.last_login)}</td>
+          <td style="color:var(--text2);font-size:12px">${fmtDate(u.created_at)}</td>
+          <td onclick="event.stopPropagation()"><div class="tbl-actions">
+            <button class="btn btn-ghost" style="padding:4px 8px;font-size:11px" onclick="showToggleUser('${u.id}',${u.is_active})">
+              ${u.is_active?'Disable':'Enable'}
+            </button>
+            <button class="btn btn-danger" style="padding:4px 8px;font-size:11px" onclick="deleteUser('${u.id}','${esc(u.username)}')">Del</button>
+          </div></td>
+        </tr>`).join('')}
       </tbody>
     </table>
     </div></div></div>`;
+
+  // Load permissions for each user in the background
+  users.forEach(u => {
+    GET(`/api/admin/users/${u.id}/key`).then(k => {
+      const bp = document.getElementById('ubp-'+u.id);
+      const rt = document.getElementById('urt-'+u.id);
+      if (!bp || !rt) return;
+      const p = k.permissions || {};
+      bp.innerHTML = p.can_use_proxy_bypass
+        ? '<span class="badge badge-green">✓ bypass</span>'
+        : '<span class="badge badge-gray">✗ direct</span>';
+      rt.innerHTML = p.can_use_router !== false
+        ? '<span class="badge badge-green">✓</span>'
+        : '<span class="badge badge-red">✗</span>';
+    }).catch(()=>{});
+  });
+}
+
+async function showUserDetail(uid, uname) {
+  const [stats, key] = await Promise.all([
+    GET(`/api/admin/users/${uid}/stats`),
+    GET(`/api/admin/users/${uid}/key`).catch(()=>({})),
+  ]);
+  const p = key.permissions || {};
+  const u = stats.user || {};
+
+  openModal(`
+    <div class="modal-title">User: ${esc(uname)}</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">
+      <div style="background:var(--bg3);border-radius:var(--r4);padding:10px">
+        <div style="font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.05em">Requests (30d)</div>
+        <div style="font-size:20px;font-weight:700;color:var(--cyan);font-family:var(--mono)">${stats.requests_30d||0}</div>
+      </div>
+      <div style="background:var(--bg3);border-radius:var(--r4);padding:10px">
+        <div style="font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.05em">Tokens (30d)</div>
+        <div style="font-size:20px;font-weight:700;color:var(--blue);font-family:var(--mono)">${((stats.tokens_30d||0)/1000).toFixed(1)}k</div>
+      </div>
+    </div>
+
+    <div style="font-size:12px;color:var(--text2);margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.05em">API Key Permissions</div>
+    <div style="background:var(--bg3);border-radius:var(--r6);padding:12px;margin-bottom:16px">
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <label style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:13px">Router Access</span>
+          <input type="checkbox" id="pp-router" ${p.can_use_router!==false?'checked':''}>
+        </label>
+        <label style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:13px">Proxy Bypass <span style="font-size:11px;color:var(--text2)">(auto-route through proxy pool → no rate limits)</span></span>
+          <input type="checkbox" id="pp-bypass" ${p.can_use_proxy_bypass?'checked':''}>
+        </label>
+        <div>
+          <div style="font-size:12px;color:var(--text2);margin-bottom:4px">Allowed Models <span style="font-size:11px">(empty = all)</span></div>
+          <input id="pp-models" class="form-input" value="${esc((p.allowed_models||[]).join(','))}" placeholder="openrouter/gpt-4o:free, kilo/auto-free  (empty = all)">
+        </div>
+        <div>
+          <div style="font-size:12px;color:var(--text2);margin-bottom:4px">Rate Limit / hour <span style="font-size:11px">(0 = unlimited)</span></div>
+          <input id="pp-rate" class="form-input" type="number" value="${p.rate_limit_per_hour||0}" style="max-width:120px">
+        </div>
+      </div>
+    </div>
+
+    <div style="font-size:12px;color:var(--text2);margin-bottom:6px">
+      <strong>Key prefix:</strong> <span class="mono">${esc(key.key_prefix||'—')}…</span>
+      &nbsp;&nbsp;<strong>Last used:</strong> ${fmtDatetime(key.last_used)}
+    </div>
+
+    <div style="font-size:12px;color:var(--text2);margin-bottom:6px">
+      <strong>Last login:</strong> ${fmtDatetime(u.last_login)}
+      &nbsp;&nbsp;<strong>Created:</strong> ${fmtDate(u.created_at)}
+    </div>
+
+    ${makeChart(stats.daily||[])}
+
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Close</button>
+      <button class="btn btn-primary" onclick="saveUserPermissions('${uid}')">Save Permissions</button>
+    </div>`);
+}
+
+async function saveUserPermissions(uid) {
+  const models_raw = document.getElementById('pp-models').value.trim();
+  const allowed = models_raw ? models_raw.split(',').map(s=>s.trim()).filter(Boolean) : [];
+  const body = {
+    can_use_router:       document.getElementById('pp-router').checked,
+    can_use_proxy_bypass: document.getElementById('pp-bypass').checked,
+    allowed_models:       allowed,
+    rate_limit_per_hour:  parseInt(document.getElementById('pp-rate').value)||0,
+  };
+  const r = await PUT(`/api/admin/users/${uid}/key/permissions`, body);
+  if (r.error) { toast(r.error.message,'err'); return; }
+  toast('Permissions updated'); closeModal(); nav('users');
 }
 
 function showCreateUser() {
   openModal(`
     <div class="modal-title">Create User</div>
-    <div class="modal-sub">New account for the OMRP dashboard.</div>
+    <div class="modal-sub">An API key is automatically generated and shown once.</div>
     <div class="form-group"><label class="form-label">Username</label><input id="m-user" class="form-input" placeholder="alice"></div>
     <div class="form-group"><label class="form-label">Password (min 8 chars)</label><input id="m-pass" class="form-input" type="password" placeholder="••••••••"></div>
     <div class="form-group"><label class="form-label">Display Name (optional)</label><input id="m-name" class="form-input" placeholder="Alice"></div>
     <div class="form-group"><label class="form-label">Role</label>
       <select id="m-role" class="form-select"><option value="0">Standard User</option><option value="1">Admin</option></select>
     </div>
+    <div class="form-group"><label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="m-bypass"> Enable Proxy Bypass (no rate limits)
+    </label></div>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="createUser()">Create</button>
+      <button class="btn btn-primary" onclick="createUser()">Create + Generate Key</button>
     </div>`);
 }
 
 async function createUser() {
   const r = await POST('/api/admin/users', {
-    username: document.getElementById('m-user').value.trim(),
-    password: document.getElementById('m-pass').value,
+    username:     document.getElementById('m-user').value.trim(),
+    password:     document.getElementById('m-pass').value,
     display_name: document.getElementById('m-name').value.trim()||undefined,
-    is_admin: document.getElementById('m-role').value === '1',
+    is_admin:     document.getElementById('m-role').value === '1',
   });
   if (r.error) { toast(r.error.message,'err'); return; }
-  toast('User created'); closeModal(); nav('users');
+
+  // If bypass requested, update permissions
+  if (document.getElementById('m-bypass').checked && r.id) {
+    await PUT(`/api/admin/users/${r.id}/key/permissions`, { can_use_proxy_bypass: true });
+  }
+
+  closeModal();
+  // Show key reveal modal
+  openModal(`
+    <div class="modal-title" style="color:var(--green)">✓ User Created</div>
+    <div class="modal-sub">Username: <strong>${esc(r.username)}</strong> &nbsp;·&nbsp; ${r.note||'Save the API key below.'}</div>
+    <div class="key-box">
+      <span class="key-val" id="kval">${esc(r.api_key||'—')}</span>
+      <button class="btn btn-success" style="padding:6px 12px;font-size:12px" onclick="copyKey()">Copy</button>
+    </div>
+    <div class="key-note">⚠ Share this key with the user — it will NOT be shown again.</div>
+    <div style="margin-top:12px;font-size:12px;color:var(--text2)">
+      The user configures their tools with:<br>
+      <span class="mono" style="color:var(--text1);font-size:11px">Base URL: ${location.origin}/v1</span><br>
+      <span class="mono" style="color:var(--text1);font-size:11px">API Key:  ${esc(r.api_key||'—')}</span>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" onclick="closeModal(); nav('users')">Done</button>
+    </div>`);
 }
+
+
 
 async function showToggleUser(id, isActive) {
   const r = await PUT(`/api/admin/users/${id}`, { is_active: !isActive });
@@ -1064,14 +1192,16 @@ async function renderLogs(ca) {
 }
 
 async function renderProxies(ca) {
-  const [{data:proxies=[]}, {data:settings=[]}] = await Promise.all([
+  const [{data:proxies=[]}, {data:settings=[]}, proxyStats] = await Promise.all([
     GET('/api/admin/proxies'),
     GET('/api/admin/settings'),
+    GET('/api/admin/proxies/stats'),
   ]);
   const sv = k => (settings.find(s=>s.key===k)||{}).value || '';
   const enabled  = sv('proxy.enabled') === '1';
   const srcUrl   = sv('proxy.source_url');
   const interval = sv('proxy.refresh_interval') || '3600';
+  const usageStats = proxyStats.proxies || [];
 
   ca.innerHTML = `
     <!-- ── Status banner ── -->
@@ -1083,8 +1213,8 @@ async function renderProxies(ca) {
         </div>
         <div style="font-size:12px;color:var(--text2);margin-top:3px">
           ${enabled
-            ? `Active — ${proxies.length} proxies in pool. On any 429, the system instantly retries via a different IP.`
-            : 'Disabled — the system waits on rate limits. Enable to bypass per-IP quotas automatically.'}
+            ? `Active — ${proxies.length} proxies in pool. Users with bypass enabled are automatically routed through proxy IPs — they never hit rate limits.`
+            : 'Disabled. Enable to allow users with bypass permission to avoid per-IP rate limits.'}
         </div>
       </div>
       <button class="btn ${enabled?'btn-danger':'btn-primary'}" onclick="toggleProxy(${enabled})" style="white-space:nowrap">
@@ -1096,28 +1226,34 @@ async function renderProxies(ca) {
     <div class="card" style="margin-bottom:16px">
       <div class="card-header"><div class="card-title">How rate-limit bypass works</div></div>
       <div class="card-body" style="font-size:12px;color:var(--text1);line-height:1.7">
-        Free LLM providers enforce <strong>per-IP quotas</strong> (e.g. 60 req/min from your IP).<br>
-        OMRP routes each retry through a different proxy IP — so every attempt looks like a fresh request:<br>
+        Free LLM providers enforce <strong>per-IP quotas</strong>.<br>
+        Users with <em>Proxy Bypass</em> enabled in their API key permissions are automatically routed through a pool of proxy IPs — every request appears to come from a different IP:<br>
         <div style="margin:10px 0;padding:10px;background:var(--bg3);border-radius:var(--r4);font-family:var(--mono);font-size:11px">
-          Request → provider → 429 ← <span style="color:var(--orange)">rate limited on your IP</span><br>
-          Retry 1 → proxy 1.2.3.4 → provider → 200 ✓ &nbsp;<span style="color:var(--green)">new IP, fresh quota</span><br>
-          Retry 2 → proxy 5.6.7.8 → provider → 200 ✓ &nbsp;<span style="color:var(--green)">if proxy 1 also limited</span>
+          User → OMRP → proxy pool[0] (1.2.3.4) → provider → ✓ 200<br>
+          User → OMRP → proxy pool[1] (5.6.7.8) → provider → ✓ 200<br>
+          User → OMRP → proxy pool[2] (9.0.1.2) → provider → ✓ 200
         </div>
-        Up to <strong>12 proxies</strong> are tried before giving up. Zero delay between retries.
+        Admin controls who gets bypass access via <strong>Users → click user → API Key Permissions → Proxy Bypass</strong>.
       </div>
     </div>
 
-    <!-- ── Stats + controls ── -->
+    <!-- ── Stats ── -->
     <div class="stats-grid" style="margin-bottom:16px">
       <div class="stat-card ${enabled?'green':''}">
         <span class="stat-icon">⊛</span>
-        <div class="stat-value">${proxies.length}</div>
-        <div class="stat-label">Active Proxies</div>
+        <div class="stat-value">${proxies.length}</div><div class="stat-label">Active Proxies</div>
       </div>
       <div class="stat-card">
         <span class="stat-icon">⏱</span>
-        <div class="stat-value">${Math.round(parseInt(interval)/60)}m</div>
-        <div class="stat-label">Auto-refresh</div>
+        <div class="stat-value">${Math.round(parseInt(interval)/60)}m</div><div class="stat-label">Auto-refresh</div>
+      </div>
+      <div class="stat-card blue">
+        <span class="stat-icon">∿</span>
+        <div class="stat-value">${proxyStats.requests_1h||0}</div><div class="stat-label">Requests (1h)</div>
+      </div>
+      <div class="stat-card cyan">
+        <span class="stat-icon">∿</span>
+        <div class="stat-value">${proxyStats.requests_24h||0}</div><div class="stat-label">Requests (24h)</div>
       </div>
     </div>
 
@@ -1126,7 +1262,7 @@ async function renderProxies(ca) {
       <div class="card-header"><div class="card-title">Settings</div></div>
       <div class="card-body">
         <div style="margin-bottom:14px">
-          <div class="form-label">Source URL (ProxyScrape-compatible JSON or plain-text list)</div>
+          <div class="form-label">Source URL</div>
           <div class="keys-row" style="margin-top:6px">
             <input id="proxy-src-url" class="form-input" value="${esc(srcUrl)}" placeholder="https://api.proxyscrape.com/...">
             <button class="btn btn-secondary" onclick="saveSettingVal('proxy.source_url',document.getElementById('proxy-src-url').value)">Save</button>
@@ -1145,10 +1281,33 @@ async function renderProxies(ca) {
     <!-- ── Actions ── -->
     <div style="display:flex;gap:10px;margin-bottom:16px">
       <button class="btn btn-primary" onclick="refreshProxies()">⟳ Refresh Pool Now</button>
-      <span style="font-size:12px;color:var(--text2);align-self:center">Fetches a fresh proxy list from the source URL</span>
     </div>
 
-    <!-- ── Proxy list ── -->
+    <!-- ── Usage Stats ── -->
+    ${usageStats.length ? `
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header"><div class="card-title">Proxy Usage Statistics</div>
+        <div style="font-size:11px;color:var(--text2)">All-time per-proxy request counts</div>
+      </div>
+      <div class="card-body" style="padding:0"><div class="tbl-wrap"><table>
+        <thead><tr><th>Proxy URL</th><th style="text-align:right">Total</th><th style="text-align:right">Success</th><th style="text-align:right">Errors</th><th style="text-align:right">Success%</th><th>Unique Users</th><th>Last Used</th></tr></thead>
+        <tbody>${usageStats.map(p=>`<tr>
+          <td><span class="mono" style="font-size:11px">${esc(p.url)}</span></td>
+          <td style="text-align:right;font-family:var(--mono)">${p.total}</td>
+          <td style="text-align:right;font-family:var(--mono);color:var(--green)">${p.ok}</td>
+          <td style="text-align:right;font-family:var(--mono);color:${p.err>0?'var(--red)':'var(--text2)'}">${p.err}</td>
+          <td style="text-align:right">
+            <span style="color:${p.success_pct>=90?'var(--green)':p.success_pct>=70?'var(--orange)':'var(--red)'}">
+              ${p.success_pct}%
+            </span>
+          </td>
+          <td style="color:var(--text2);font-size:12px">${p.users}</td>
+          <td style="color:var(--text2);font-size:12px">${fmtDatetime(p.last_used)}</td>
+        </tr>`).join('')}</tbody>
+      </table></div></div>
+    </div>` : ''}
+
+    <!-- ── Pool list ── -->
     <div class="card"><div class="card-body" style="padding:0"><div class="tbl-wrap">
     <table>
       <thead><tr><th>#</th><th>URL</th></tr></thead>
@@ -1156,7 +1315,7 @@ async function renderProxies(ca) {
         <td style="color:var(--text2);font-size:12px">${p.id}</td>
         <td><span class="mono" style="font-size:12px">${esc(p.url)}</span></td>
       </tr>`).join('') : `<tr><td colspan="2"><div class="empty"><div class="empty-icon">⊛</div><div class="empty-title">No proxies in pool</div>
-        <div class="empty-sub">${enabled?'Click "Refresh Pool Now" to fetch proxies from the source URL.':'Enable proxy rotation above, then click Refresh Pool.'}</div></div></td></tr>`}
+        <div class="empty-sub">${enabled?'Click "Refresh Pool Now" to fetch proxies.':'Enable proxy rotation above first.'}</div></div></td></tr>`}
       ${proxies.length>100?`<tr><td colspan="2" style="text-align:center;color:var(--text2);padding:12px;font-size:12px">…and ${proxies.length-100} more</td></tr>`:''}
       </tbody>
     </table>
@@ -1216,52 +1375,98 @@ async function renderModels(ca) {
 // ═══════════════════════════════════════════════════════════════════
 
 async function renderMyKeys(ca) {
-  const {data:keys=[]} = await GET('/api/user/api-keys');
+  // Each user has exactly 1 API key — load it via the new endpoint
+  const key = await GET('/api/user/key').catch(()=>({}));
+  const p   = key.permissions || {};
+  const baseUrl = `${location.origin}/v1`;
+  const prefix  = key.key_prefix || '—';
+
   ca.innerHTML = `
     <div class="section-header">
-      <div><div class="section-title">My API Keys</div><div class="section-sub">Use these to access the OMRP proxy from any tool</div></div>
-      <button class="btn btn-primary" onclick="showCreateMyKey()">+ Generate Key</button>
+      <div><div class="section-title">My API Key</div><div class="section-sub">Your router access key — 1 key per account</div></div>
     </div>
-    <div class="card"><div class="card-body" style="padding:0"><div class="tbl-wrap">
-    <table>
-      <thead><tr><th>Label</th><th>Key Prefix</th><th>Status</th><th>Last Used</th><th>Created</th><th></th></tr></thead>
-      <tbody>${keys.length ? keys.map(k=>`<tr>
-        <td>${esc(k.label)}</td>
-        <td><span class="mono">${esc(k.key_prefix)}…</span></td>
-        <td>${yesno(k.is_active)}</td>
-        <td style="color:var(--text2);font-size:12px">${fmtDatetime(k.last_used)}</td>
-        <td style="color:var(--text2);font-size:12px">${fmtDate(k.created_at)}</td>
-        <td>${k.is_active?`<button class="btn btn-danger" style="padding:4px 8px;font-size:11px" onclick="revokeKey('/api/user/api-keys/${k.id}','my-keys')">Revoke</button>`:''}
-        </td>
-      </tr>`).join('') : `<tr><td colspan="6"><div class="empty"><div class="empty-icon">⌗</div><div class="empty-title">No keys yet</div><div class="empty-sub">Generate a key to use OMRP from Cursor, Claude Desktop, Continue, etc.</div></div></td></tr>`}
-      </tbody>
-    </table>
-    </div></div></div>
-    <div class="card" style="margin-top:16px">
-      <div class="card-header"><div class="card-title">How to use</div></div>
+
+    <!-- ── Key card ── -->
+    ${key.id ? `
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header"><div class="card-title">Your API Key</div></div>
       <div class="card-body">
-        <p style="font-size:12px;color:var(--text1);margin-bottom:10px">Set your tool's OpenAI base URL to <code style="background:var(--bg3);padding:2px 6px;border-radius:4px;font-family:var(--mono)">http://localhost:18800/v1</code> and use your OMRP key as the API key.</p>
-        <p style="font-size:12px;color:var(--text1)">Model name <code style="background:var(--bg3);padding:2px 6px;border-radius:4px;font-family:var(--mono)">omrp/auto</code> uses OMRP's intelligent routing. Or specify any model ID directly.</p>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+          <div style="flex:1">
+            <div style="font-size:13px;font-weight:600">${esc(key.label||'account-default')}</div>
+            <div style="font-family:var(--mono);font-size:12px;color:var(--cyan)">${prefix}… <span style="color:var(--text2);font-family:var(--sans)">(prefix — full key was shown at account creation)</span></div>
+          </div>
+          <div>${yesno(key.is_active)}</div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;color:var(--text2)">
+          <div><strong style="color:var(--text1)">Created:</strong> ${fmtDate(key.created_at)}</div>
+          <div><strong style="color:var(--text1)">Last used:</strong> ${fmtDatetime(key.last_used)}</div>
+        </div>
+      </div>
+    </div>` : `
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-body" style="padding:16px;text-align:center;color:var(--text2)">
+        No API key found — contact your administrator.
+      </div>
+    </div>`}
+
+    <!-- ── Permissions ── -->
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header"><div class="card-title">Your Permissions</div></div>
+      <div class="card-body" style="padding:14px">
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <span style="font-size:13px">Router Access</span>
+            ${p.can_use_router!==false?'<span class="badge badge-green">✓ Enabled</span>':'<span class="badge badge-red">✗ Disabled</span>'}
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <span style="font-size:13px">Proxy Bypass <span style="font-size:11px;color:var(--text2)">(routes through proxy pool — no rate limits)</span></span>
+            ${p.can_use_proxy_bypass?'<span class="badge badge-green">✓ Active</span>':'<span class="badge badge-gray">✗ Direct only</span>'}
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <span style="font-size:13px">Allowed Models</span>
+            <span style="font-size:12px;color:var(--text2)">${(p.allowed_models||[]).length?esc((p.allowed_models||[]).join(', ')):'All models'}</span>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <span style="font-size:13px">Rate Limit</span>
+            <span style="font-size:12px;color:var(--text2)">${(p.rate_limit_per_hour||0)>0?p.rate_limit_per_hour+' req/hr':'Unlimited'}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Integration guide ── -->
+    <div class="card">
+      <div class="card-header"><div class="card-title">Integration Guide</div></div>
+      <div class="card-body" style="font-size:13px">
+        <div style="margin-bottom:14px">
+          <div class="form-label">Server URL</div>
+          <div style="font-family:var(--mono);font-size:12px;background:var(--bg3);padding:10px;border-radius:var(--r6);margin-top:4px;display:flex;align-items:center;justify-content:space-between">
+            <span style="color:var(--cyan)">${esc(baseUrl)}</span>
+            <button class="btn btn-ghost" style="padding:3px 8px;font-size:11px" onclick="navigator.clipboard.writeText('${esc(baseUrl)}').then(()=>toast('Copied!'))">Copy</button>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr;gap:10px">
+          ${[
+            ['Cursor',        'Settings → Models → Add Model: base URL above, any model ID, your key as API key'],
+            ['Claude Desktop','claude_desktop_config.json: "apiKey": "your-key", "baseURL": "'+baseUrl+'"'],
+            ['Continue',      'models[].apiBase: "'+baseUrl+'", apiKey: "your-key", model: "omrp/auto"'],
+            ['Open WebUI',    'Admin Panel → Connections → OpenAI API: base URL above, your key'],
+            ['Any OpenAI SDK','openai.OpenAI(api_key="your-key", base_url="'+baseUrl+'")'],
+          ].map(([tool,hint])=>`
+            <div style="background:var(--bg3);border-radius:var(--r4);padding:10px">
+              <div style="font-weight:600;font-size:12px;color:var(--text1);margin-bottom:3px">${tool}</div>
+              <div style="font-size:11px;color:var(--text2)">${esc(hint)}</div>
+            </div>`).join('')}
+        </div>
+        <div style="margin-top:12px;font-size:12px;color:var(--text2)">
+          Use model <code style="background:var(--bg3);padding:1px 5px;border-radius:3px;font-family:var(--mono)">omrp/auto</code> for smart routing, or any specific model ID from the list.
+        </div>
       </div>
     </div>`;
 }
 
-function showCreateMyKey() {
-  openModal(`
-    <div class="modal-title">Generate API Key</div>
-    <div class="modal-sub">The key will be shown once. Copy it immediately.</div>
-    <div class="form-group"><label class="form-label">Label</label><input id="m-label" class="form-input" placeholder="Cursor, Continue…"></div>
-    <div class="modal-footer">
-      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="createMyKey()">Generate</button>
-    </div>`);
-}
 
-async function createMyKey() {
-  const r = await POST('/api/user/api-keys', {label: document.getElementById('m-label').value.trim()||'default'});
-  if (r.error) { toast(r.error.message,'err'); return; }
-  showKeyReveal(r.key, r.label, ()=>nav('my-keys'));
-}
 
 async function renderMyProviders(ca) {
   const {data:keys=[]} = await GET('/api/user/provider-keys');
@@ -1342,7 +1547,7 @@ let setupStep = 0;
 const setupData = {};
 
 function renderSetupStep() {
-  [0,1,2].forEach(i => {
+  [0,1,2,3].forEach(i => {
     const d = document.getElementById('sdot'+i);
     if (d) d.className = 'step-dot' + (i < setupStep ? ' done' : i === setupStep ? ' active' : '');
   });
@@ -1362,6 +1567,26 @@ function renderSetupStep() {
       <div class="setup-sub">Customize the name shown in the interface.</div>
       <div class="form-group"><label class="form-label">Application Name</label><input id="s-appname" class="form-input" value="OMRP" placeholder="OMRP"></div>
       <button class="btn btn-primary btn-full" style="margin-top:16px" onclick="setupNext1()">Continue →</button>`;
+  } else if (setupStep === 2) {
+    // Show the admin API key — this is the most important step
+    const apiKey = setupData.adminApiKey || '(not available)';
+    const baseUrl = location.origin + '/v1';
+    body.innerHTML = `
+      <div class="setup-title" style="color:var(--green)">✓ Admin Account Created</div>
+      <div class="setup-sub">Your admin API key has been generated. <strong>Save it now — it will never be shown again.</strong></div>
+      <div class="key-box">
+        <span class="key-val" id="setup-kval">${esc(apiKey)}</span>
+        <button class="btn btn-success" style="padding:6px 12px;font-size:12px" onclick="document.getElementById('setup-kval')&&navigator.clipboard.writeText('${esc(apiKey)}').then(()=>alert('Copied!'))">Copy</button>
+      </div>
+      <div class="key-note" style="margin:10px 0">
+        ⚠ This is your admin API key. Store it in a password manager.
+      </div>
+      <div style="background:var(--bg3);border-radius:var(--r6);padding:12px;font-size:12px;margin-bottom:14px">
+        <div style="font-weight:600;color:var(--text1);margin-bottom:6px">Quick setup for AI tools:</div>
+        <div style="font-family:var(--mono);color:var(--cyan)">${esc(baseUrl)}</div>
+        <div style="color:var(--text2);margin-top:2px">API Key: <span style="font-family:var(--mono);color:var(--text1)">${esc(apiKey.substring(0,20))}…</span></div>
+      </div>
+      <button class="btn btn-primary btn-full" onclick="setupNext2()">Continue →</button>`;
   } else {
     body.innerHTML = `
       <div class="setup-title" style="color:var(--green)">✓ Setup Complete</div>
@@ -1378,8 +1603,9 @@ async function setupNext0() {
   if (!user || pass.length < 8) { err.style.display='block'; err.textContent='Username required, password ≥ 8 chars'; return; }
   const r = await POST('/api/setup', { username:user, password:pass, display_name:name||undefined });
   if (r.error) { err.style.display='block'; err.textContent=r.error.message; return; }
-  setupData.username = user;
-  setupData.password = pass;
+  setupData.username    = user;
+  setupData.password    = pass;
+  setupData.adminApiKey = r.api_key || '';
   setupStep = 1;
   renderSetupStep();
 }
@@ -1387,6 +1613,11 @@ async function setupNext0() {
 function setupNext1() {
   setupData.appName = document.getElementById('s-appname').value.trim() || 'OMRP';
   setupStep = 2;
+  renderSetupStep();
+}
+
+function setupNext2() {
+  setupStep = 3;
   renderSetupStep();
 }
 
