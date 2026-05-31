@@ -2839,6 +2839,281 @@ window.addEventListener('offline', () => updateConnStatus(false));
 
 // Periodic check every 30s (only when page is visible)
 setInterval(() => { if (!document.hidden) checkHealth(); }, 30_000);
+
+// ── OMRP AI Agent widget ───────────────────────────────────────────────────────
+// Floating bottom-right chat assistant. Uses the local /v1/chat/completions
+// endpoint with a built-in system prompt focused on OMRP usage and onboarding.
+
+(function() {
+  // ── Inject styles ───────────────────────────────────────────────────────────
+  const style = document.createElement('style');
+  style.textContent = `
+    #omrp-agent-fab {
+      position: fixed; bottom: 24px; right: 24px; z-index: 9000;
+      width: 52px; height: 52px; border-radius: 50%;
+      background: linear-gradient(135deg, var(--cyan), var(--blue));
+      border: none; cursor: pointer; display: none; align-items: center;
+      justify-content: center; font-size: 22px;
+      box-shadow: 0 4px 20px #00000060, 0 0 0 0 var(--cyan)40;
+      animation: agentPulse 3s ease-in-out infinite;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    #omrp-agent-fab:hover { transform: scale(1.08); box-shadow: 0 6px 28px #00000070, 0 0 16px var(--cyan)30; }
+    @keyframes agentPulse {
+      0%,100% { box-shadow: 0 4px 20px #00000060, 0 0 0   0 var(--cyan)30; }
+      50%      { box-shadow: 0 4px 20px #00000060, 0 0 0 10px var(--cyan)00; }
+    }
+    #omrp-agent-panel {
+      position: fixed; bottom: 88px; right: 24px; z-index: 8999;
+      width: 375px; max-height: 520px;
+      background: var(--bg1); border: 1px solid var(--border);
+      border-radius: var(--r12); box-shadow: 0 8px 40px #00000080;
+      display: none; flex-direction: column;
+      transform-origin: bottom right;
+      animation: agentSlideIn 0.18s cubic-bezier(.4,0,.2,1);
+    }
+    #omrp-agent-panel.open { display: flex; }
+    @keyframes agentSlideIn {
+      from { opacity: 0; transform: scale(0.92) translateY(10px); }
+      to   { opacity: 1; transform: scale(1)    translateY(0); }
+    }
+    #agent-msgs {
+      flex: 1; overflow-y: auto; padding: 14px; display: flex;
+      flex-direction: column; gap: 10px; min-height: 0;
+    }
+    .agent-msg-user {
+      align-self: flex-end; background: var(--blue)22;
+      border: 1px solid var(--blue)30; border-radius: var(--r8);
+      padding: 8px 12px; max-width: 88%; font-size: 13px;
+      color: var(--text0); white-space: pre-wrap; word-break: break-word;
+    }
+    .agent-msg-ai {
+      align-self: flex-start; background: var(--bg3);
+      border: 1px solid var(--border); border-radius: var(--r8);
+      padding: 8px 12px; max-width: 92%; font-size: 13px;
+      color: var(--text0); line-height: 1.6; white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .agent-msg-ai a { color: var(--cyan); }
+    .agent-typing { display: flex; gap: 4px; align-items: center; padding: 4px 0; }
+    .agent-dot { width: 6px; height: 6px; border-radius: 50%;
+      background: var(--text3); animation: agentDot 1.2s ease-in-out infinite; }
+    .agent-dot:nth-child(2) { animation-delay: 0.2s; }
+    .agent-dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes agentDot { 0%,80%,100%{transform:scale(0.8);opacity:0.4} 40%{transform:scale(1.1);opacity:1} }
+  `;
+  document.head.appendChild(style);
+
+  // ── Inject HTML ─────────────────────────────────────────────────────────────
+  const fab = document.createElement('button');
+  fab.id = 'omrp-agent-fab';
+  fab.title = 'OMRP Assistant';
+  fab.innerHTML = '⚡';
+  fab.onclick = agentToggle;
+  document.body.appendChild(fab);
+
+  const panel = document.createElement('div');
+  panel.id = 'omrp-agent-panel';
+  panel.innerHTML = `
+    <div style="padding:12px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
+      <span style="font-size:16px;filter:drop-shadow(0 0 6px var(--cyan)50)">⚡</span>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:700;color:var(--text0)">OMRP Assistant</div>
+        <div style="font-size:10px;color:var(--text2)">Ask about providers, keys, routing…</div>
+      </div>
+      <button onclick="agentClear()" title="Clear chat"
+        style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:2px 6px">↺</button>
+      <button onclick="agentClose()"
+        style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;padding:2px 6px">✕</button>
+    </div>
+    <div id="agent-msgs"></div>
+    <div style="padding:10px;border-top:1px solid var(--border);display:flex;gap:8px">
+      <textarea id="agent-inp" rows="2"
+        style="flex:1;resize:none;background:var(--bg3);border:1px solid var(--border);
+          border-radius:var(--r6);color:var(--text0);padding:7px 10px;font-size:12px;
+          font-family:var(--sans);outline:none;line-height:1.5"
+        placeholder="Ask anything… (Enter to send)"
+        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();agentSend();}"></textarea>
+      <button onclick="agentSend()" id="agent-send-btn"
+        style="background:linear-gradient(135deg,var(--cyan),var(--blue));border:none;
+          border-radius:var(--r6);color:#000;cursor:pointer;padding:0 14px;
+          font-size:18px;font-weight:700;transition:opacity 0.15s">↵</button>
+    </div>
+    <div style="padding:4px 14px 8px;font-size:10px;color:var(--text3);text-align:center">
+      Powered by OMRP — uses your configured provider keys
+    </div>`;
+  document.body.appendChild(panel);
+
+  // ── State ───────────────────────────────────────────────────────────────────
+  let agentHistory = [];
+  let agentBusy    = false;
+  let agentGreeted = false;
+
+  const SYSTEM_PROMPT = `You are the OMRP Assistant — a helpful guide for the OMRP (Open Model Routing Protocol) self-hosted LLM gateway.
+
+You help users:
+- Understand how OMRP routes prompts to the best free LLM model automatically
+- Get free API keys from providers (OpenRouter, Groq, Cerebras, Kilo, GitHub Models, Google Gemini, Mistral, etc.)
+- Add provider keys to OMRP via the "Free Providers" page or "My Providers" menu
+- Use the playground to test models
+- Understand their API key permissions, rate limits, and usage stats
+- Configure the system as an admin
+
+Key facts about OMRP:
+- Base URL for all tools: the server's /v1 endpoint
+- Use "omrp/auto" as the model name for intelligent auto-routing
+- Free providers: OpenRouter (35+ free models), Groq (ultra-fast), Cerebras (wafer-scale), Kilo, Google Gemini, Mistral, GitHub Models, and more
+- Each user gets one API key (omrp-sk-...) shown once at creation; regenerate in "My API Key" page
+- Proxy bypass rotates IPs to avoid free-tier rate limits
+
+Keep responses concise and practical. Use markdown formatting. Link to provider signup pages when relevant.`;
+
+  // ── Helper: add message bubble ──────────────────────────────────────────────
+  function addMsg(role, text) {
+    const msgs = document.getElementById('agent-msgs');
+    if (!msgs) return null;
+    const div = document.createElement('div');
+    div.className = role === 'user' ? 'agent-msg-user' : 'agent-msg-ai';
+    div.textContent = text;
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+    return div;
+  }
+
+  function addTyping() {
+    const msgs = document.getElementById('agent-msgs');
+    if (!msgs) return null;
+    const d = document.createElement('div');
+    d.className = 'agent-msg-ai agent-typing';
+    d.innerHTML = '<div class="agent-dot"></div><div class="agent-dot"></div><div class="agent-dot"></div>';
+    msgs.appendChild(d);
+    msgs.scrollTop = msgs.scrollHeight;
+    return d;
+  }
+
+  // ── Toggle / open / close / clear ───────────────────────────────────────────
+  window.agentToggle = function() {
+    const p = document.getElementById('omrp-agent-panel');
+    if (!p) return;
+    p.classList.toggle('open');
+    if (p.classList.contains('open') && !agentGreeted) {
+      agentGreeted = true;
+      const name = (typeof S !== 'undefined' && S.user?.username) || 'there';
+      addMsg('ai', `Hi ${name}! I'm your OMRP assistant.\n\nI can help you:\n• Get free API keys for LLM providers\n• Add providers to OMRP\n• Understand routing and permissions\n• Troubleshoot issues\n\nWhat would you like to do?`);
+    }
+    if (p.classList.contains('open')) {
+      setTimeout(() => document.getElementById('agent-inp')?.focus(), 50);
+    }
+  };
+  window.agentClose = function() {
+    document.getElementById('omrp-agent-panel')?.classList.remove('open');
+  };
+  window.agentClear = function() {
+    agentHistory = [];
+    agentGreeted = false;
+    const msgs = document.getElementById('agent-msgs');
+    if (msgs) msgs.innerHTML = '';
+    agentToggle(); agentToggle(); // reopen = fresh greeting
+  };
+
+  // ── Send message ────────────────────────────────────────────────────────────
+  window.agentSend = async function() {
+    if (agentBusy) return;
+    const inp  = document.getElementById('agent-inp');
+    const btn  = document.getElementById('agent-send-btn');
+    const text = inp?.value.trim();
+    if (!text || !inp) return;
+    inp.value = '';
+    addMsg('user', text);
+    agentHistory.push({ role: 'user', content: text });
+
+    agentBusy = true;
+    if (btn) btn.disabled = true;
+    const typing = addTyping();
+
+    const messages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      ...agentHistory.slice(-12), // keep last 12 turns to avoid context overflow
+    ];
+
+    try {
+      const token = (typeof S !== 'undefined' && S.token) || '';
+      const res = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          model: 'omrp/auto',
+          messages,
+          max_tokens: 600,
+          stream: true,
+        }),
+      });
+
+      if (typing?.parentNode) typing.remove();
+
+      if (!res.ok) {
+        let errMsg = `HTTP ${res.status}`;
+        try { errMsg = (await res.json()).error?.message || errMsg; } catch {}
+        const d = addMsg('ai', `Sorry, I couldn't get a response: ${errMsg}\n\nMake sure you have at least one provider key configured under Free Providers or My Providers.`);
+        agentHistory.push({ role: 'assistant', content: d?.textContent || '' });
+        return;
+      }
+
+      // SSE streaming
+      const aiDiv = addMsg('ai', '');
+      const msgs  = document.getElementById('agent-msgs');
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '', full = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n'); buf = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') break;
+          try {
+            const chunk = JSON.parse(data);
+            const delta = chunk.choices?.[0]?.delta?.content || '';
+            if (delta) {
+              full += delta;
+              if (aiDiv) aiDiv.textContent = full;
+              if (msgs) msgs.scrollTop = msgs.scrollHeight;
+            }
+          } catch {}
+        }
+      }
+
+      agentHistory.push({ role: 'assistant', content: full });
+
+    } catch (e) {
+      if (typing?.parentNode) typing.remove();
+      addMsg('ai', `Network error: ${e.message || e}\n\nPlease check that the server is running.`);
+    } finally {
+      agentBusy = false;
+      if (btn) btn.disabled = false;
+      inp?.focus();
+    }
+  };
+
+  // ── Show FAB only when logged in ────────────────────────────────────────────
+  // Poll every second until S.user is set, then reveal the FAB.
+  (function waitForUser() {
+    const interval = setInterval(() => {
+      if (typeof S !== 'undefined' && S.user) {
+        clearInterval(interval);
+        const fab = document.getElementById('omrp-agent-fab');
+        if (fab) fab.style.display = 'flex';
+      }
+    }, 800);
+  })();
+})();
 </script>
 </body>
 </html>
