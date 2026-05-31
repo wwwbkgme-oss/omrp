@@ -112,14 +112,40 @@ pub struct CompletionResult {
 /// Blocking OpenAI-compatible HTTP client.
 ///
 /// Works with any provider that speaks the `/v1/chat/completions` protocol.
+/// Optionally routes requests through a proxy to bypass per-IP rate limits —
+/// call `.with_proxy("http://ip:port")` after construction.
 pub struct CompatClient {
-    base_url: String,
-    api_key: String,
+    base_url:  String,
+    api_key:   String,
+    /// Optional proxy URL, e.g. `http://1.2.3.4:8080` or `socks5://…`.
+    proxy_url: Option<String>,
     #[allow(dead_code)]
     kind: ProviderKind,
 }
 
 impl CompatClient {
+    /// Attach a proxy to this client.  Returns a new client that routes all
+    /// requests through the given proxy URL.
+    pub fn with_proxy(mut self, proxy_url: impl Into<String>) -> Self {
+        self.proxy_url = Some(proxy_url.into());
+        self
+    }
+
+    /// Build a `ureq::Agent` optionally configured with a proxy.
+    ///
+    /// When `proxy_url` is `None` the agent behaves like a plain `ureq::post`.
+    fn build_agent(&self) -> ureq::Agent {
+        let builder = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(60));
+        if let Some(ref proxy) = self.proxy_url {
+            match ureq::Proxy::new(proxy) {
+                Ok(p)  => return builder.proxy(p).build(),
+                Err(e) => eprintln!("[proxy] invalid proxy URL {proxy:?}: {e}"),
+            }
+        }
+        builder.build()
+    }
     /// Build a client for a known provider, reading the API key from the
     /// appropriate environment variable.
     pub fn for_provider(provider: &str) -> Result<Self, String> {
@@ -150,7 +176,7 @@ impl CompatClient {
                 }
             )
         })?;
-        Ok(Self { base_url: kind.base_url().into(), api_key, kind })
+        Ok(Self { base_url: kind.base_url().into(), api_key, kind, proxy_url: None })
     }
 
     /// Build a client using an explicit API key (e.g. stored in the database).
@@ -158,7 +184,7 @@ impl CompatClient {
     pub fn from_key_and_provider(provider: &str, api_key: &str) -> Result<Self, String> {
         let kind = ProviderKind::from_str(provider)
             .ok_or_else(|| format!("Unknown provider: {provider:?}"))?;
-        Ok(Self { base_url: kind.base_url().into(), api_key: api_key.to_string(), kind })
+        Ok(Self { base_url: kind.base_url().into(), api_key: api_key.to_string(), kind, proxy_url: None })
     }
 
     /// Provider name for display.
@@ -169,18 +195,17 @@ impl CompatClient {
 
     /// Make a **streaming** chat request.
     ///
-    /// Returns the raw SSE `Box<dyn Read>` body on success.
-    /// The caller is responsible for forwarding chunks to the client.
-    /// Errors that arrive as HTTP status codes (4xx/5xx) are mapped to
-    /// `ProviderError` before returning so the caller can try a fallback.
+    /// Returns the raw SSE body reader on success.  When a proxy is configured
+    /// the request exits through that proxy IP (rate-limit bypass).
     pub fn stream_request(
         &self,
         body: &Value,
     ) -> Result<Box<dyn std::io::Read + Send + 'static>, ProviderError> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url      = format!("{}/chat/completions", self.base_url);
         let body_str = body.to_string();
+        let agent    = self.build_agent();
 
-        match ureq::post(&url)
+        match agent.post(&url)
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .set("Content-Type", "application/json")
             .set("HTTP-Referer", HTTP_REFERER)
@@ -197,6 +222,8 @@ impl CompatClient {
     }
 
     /// Send a single chat-completion request.
+    ///
+    /// When a proxy is configured every byte exits through that proxy IP.
     pub fn complete(
         &self,
         model_id: &str,
@@ -217,8 +244,9 @@ impl CompatClient {
         });
 
         let started = Instant::now();
+        let agent   = self.build_agent();
 
-        let response = ureq::post(&url)
+        let response = agent.post(&url)
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .set("Content-Type", "application/json")
             .set("HTTP-Referer", HTTP_REFERER)
@@ -244,8 +272,11 @@ impl CompatClient {
 
     /// Complete with automatic retry.
     ///
-    /// - 429 RateLimited → wait `retry_after` (max 60 s), retry once.
-    /// - Network error   → wait 1 s, retry once.
+    /// - 429 RateLimited → **no wait**, signals caller to switch proxy.
+    ///   The `complete_with_proxy_rotation` method in web_server.rs handles
+    ///   the actual proxy swap; this method simply returns the error immediately
+    ///   so the caller can react as fast as possible.
+    /// - Network error → wait 1 s, retry once on the same proxy.
     /// - Any other error → return immediately.
     pub fn complete_with_retry(
         &self,
@@ -255,10 +286,9 @@ impl CompatClient {
     ) -> Result<CompletionResult, ProviderError> {
         match self.complete(model_id, messages, max_tokens) {
             Err(ProviderError::RateLimited { retry_after }) => {
-                let wait = retry_after.unwrap_or(5).min(60);
-                eprintln!("  [rate-limited] waiting {wait}s before retry…");
-                std::thread::sleep(Duration::from_secs(wait));
-                self.complete(model_id, messages, max_tokens)
+                // Do NOT sleep here — the proxy rotation layer will immediately
+                // retry via a different IP.  Only sleep as last resort.
+                Err(ProviderError::RateLimited { retry_after })
             }
             Err(ProviderError::Network(msg)) => {
                 eprintln!("  [network error] {msg} — retrying in 1s…");
@@ -365,6 +395,21 @@ mod tests {
         assert_eq!(ProviderKind::from_str("groq"),       Some(ProviderKind::Groq));
         assert_eq!(ProviderKind::from_str("Groq"),       Some(ProviderKind::Groq));
         assert_eq!(ProviderKind::from_str("unknown"),    None);
+    }
+
+    #[test]
+    fn test_with_proxy_sets_proxy_url() {
+        let client = CompatClient::from_key_and_provider("openrouter", "sk-test-key").unwrap();
+        assert!(client.proxy_url.is_none());
+        let proxied = client.with_proxy("http://1.2.3.4:8080");
+        assert_eq!(proxied.proxy_url.as_deref(), Some("http://1.2.3.4:8080"));
+    }
+
+    #[test]
+    fn test_build_agent_no_proxy() {
+        let client = CompatClient::from_key_and_provider("groq", "gsk-test").unwrap();
+        // Should build without panic even without a proxy
+        let _agent = client.build_agent();
     }
 
     #[test]
