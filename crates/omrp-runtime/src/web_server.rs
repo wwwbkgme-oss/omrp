@@ -1204,12 +1204,21 @@ async fn user_revoke_provider_key(
 // ─── User: stats + profile ────────────────────────────────────────────────────
 
 async fn user_stats(
-    State(state): State<Arc<AppState>>, _user: AuthUser,
+    State(state): State<Arc<AppState>>, user: AuthUser,
 ) -> Response {
-    let stats = state.db.usage_stats(30).unwrap_or_default();
-    ok(json!({ "daily": stats.iter().map(|(d,r,e,t)| json!({
-        "date": d, "requests": r, "errors": e, "tokens": t
-    })).collect::<Vec<_>>() }))
+    // Must use user_usage_stats with the caller's user_id — NOT global usage_stats
+    let daily = state.db.user_usage_stats(&user.user_id, 30).unwrap_or_default();
+    let total_req: i64 = daily.iter().map(|d| d.1).sum();
+    let total_err: i64 = daily.iter().map(|d| d.2).sum();
+    let total_tok: i64 = daily.iter().map(|d| d.3).sum();
+    ok(json!({
+        "daily": daily.iter().map(|(d,r,e,t)| json!({
+            "date": d, "requests": r, "errors": e, "tokens": t
+        })).collect::<Vec<_>>(),
+        "total_requests": total_req,
+        "total_errors":   total_err,
+        "total_tokens":   total_tok,
+    }))
 }
 
 async fn user_profile(
