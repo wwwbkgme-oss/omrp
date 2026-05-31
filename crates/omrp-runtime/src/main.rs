@@ -17,6 +17,7 @@ mod db;
 mod provider;
 mod proxy;
 mod routing;
+mod validation;
 mod web_server;
 
 use std::path::Path;

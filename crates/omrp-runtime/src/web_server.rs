@@ -38,6 +38,10 @@ use crate::auth::{
 use crate::config::Config;
 use crate::db::{ApiKeyPermissions, ApiKeyRow, Database, ProviderKeyRow, UserRow};
 use crate::routing::{bootstrap_pipeline, select_for_tier, tier_model_ids};
+use crate::validation::{
+    validate_allowed_models, validate_api_key_value, validate_display_name,
+    validate_email, validate_label, validate_password, validate_username,
+};
 use omrp_core::classifier::{classify_prompt, detect_mode_override};
 use omrp_core::router::RouterEngine;
 use omrp_types::task::RouteRequest;
@@ -300,6 +304,15 @@ async fn setup_init(
     if req.username.trim().is_empty() || req.password.len() < 8 {
         return err(StatusCode::BAD_REQUEST, "Username required, password must be ≥ 8 chars");
     }
+    if let Err(e) = validate_username(req.username.trim()) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    if let Err(e) = validate_password(&req.password) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    if let Err(e) = validate_display_name(req.display_name.as_deref().unwrap_or("")) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
     let hash = match hash_password(&req.password) {
         Ok(h) => h,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -377,8 +390,17 @@ async fn admin_create_user(
     Json(req): Json<CreateUserRequest>,
 ) -> Response {
     if let Some(e) = require_admin(&user) { return e; }
-    if req.password.len() < 8 {
-        return err(StatusCode::BAD_REQUEST, "Password must be ≥ 8 chars");
+    if let Err(e) = validate_username(req.username.trim()) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    if let Err(e) = validate_password(&req.password) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    if let Err(e) = validate_display_name(req.display_name.as_deref().unwrap_or("")) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    if let Err(e) = validate_email(req.email.as_deref().unwrap_or("")) {
+        return err(StatusCode::BAD_REQUEST, e);
     }
     let hash = match hash_password(&req.password) {
         Ok(h) => h,
@@ -440,7 +462,7 @@ async fn admin_update_user(
         }
     }
     if let Some(pw) = req.password {
-        if pw.len() < 8 { return err(StatusCode::BAD_REQUEST, "Password must be ≥ 8 chars"); }
+        if let Err(e) = validate_password(&pw) { return err(StatusCode::BAD_REQUEST, e); }
         let hash = match hash_password(&pw) {
             Ok(h) => h,
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -593,6 +615,12 @@ async fn admin_create_provider_key(
     Json(req): Json<CreateProviderKeyRequest>,
 ) -> Response {
     if let Some(e) = require_admin(&user) { return e; }
+    if let Err(e) = validate_api_key_value(&req.key_value) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    if let Err(e) = validate_label(req.label.as_deref().unwrap_or("")) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
     let ts = now_secs() as i64;
     let row = ProviderKeyRow {
         id:         Uuid::new_v4().to_string(),
@@ -945,7 +973,10 @@ async fn admin_update_user_key_permissions(
     let mut perms = ApiKeyPermissions::from_json(&key.permissions);
     if let Some(v) = req.can_use_router       { perms.can_use_router = v; }
     if let Some(v) = req.can_use_proxy_bypass { perms.can_use_proxy_bypass = v; }
-    if let Some(v) = req.allowed_models       { perms.allowed_models = v; }
+    if let Some(v) = req.allowed_models {
+        if let Err(e) = validate_allowed_models(&v) { return err(StatusCode::BAD_REQUEST, e); }
+        perms.allowed_models = v;
+    }
     if let Some(v) = req.rate_limit_per_hour  { perms.rate_limit_per_hour = v; }
     let ts = now_secs() as i64;
     match state.db.update_api_key_permissions(&key.id, &perms) {
@@ -1130,6 +1161,12 @@ async fn user_create_provider_key(
     State(state): State<Arc<AppState>>, user: AuthUser,
     Json(req): Json<CreateProviderKeyRequest>,
 ) -> Response {
+    if let Err(e) = validate_api_key_value(&req.key_value) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    if let Err(e) = validate_label(req.label.as_deref().unwrap_or("")) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
     let ts = now_secs() as i64;
     let row = ProviderKeyRow {
         id:         Uuid::new_v4().to_string(),
