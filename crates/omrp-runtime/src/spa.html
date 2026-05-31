@@ -349,7 +349,7 @@ tbody td{padding:10px 14px;font-size:13px;color:var(--text1);vertical-align:midd
         ['⚡','Smart Routing','Bayesian classifier assigns every prompt a tier (simple→complex→reasoning) and picks the fastest available model automatically.','cyan'],
         ['🔑','Per-User API Keys','Each user gets their own omrp-sk- key with configurable permissions: rate limits, model allow-lists, proxy bypass.','blue'],
         ['⊛','Proxy Rate-Limit Bypass','Built-in proxy pool rotates IPs on 429 errors so users with bypass permission never hit free-tier rate limits.','purple'],
-        ['◈','Multi-Provider','OpenRouter, Groq, Cerebras, Kilo, BUW, or any custom OpenAI-compatible endpoint — add a key and it appears in the model list.','green'],
+        ['◈','Multi-Provider','OpenRouter, Groq, Cerebras, Kilo, SambaNova, Codestral, Together AI, or any custom OpenAI-compatible endpoint — add a key and it appears in the model list.','green'],
         ['∷','Audit & Analytics','Every request is logged. Admins see global stats; users see their own usage. Full audit trail for all admin actions.','orange'],
         ['◉','Bayesian Learning','The routing engine tracks per-model latency, error rates and success scores, improving routing decisions over time.','cyan'],
       ].map(([icon,title,desc,cl])=>`
@@ -547,8 +547,8 @@ const fmtDate = ts => ts ? new Date(ts*1000).toLocaleDateString('en-US',{month:'
 const fmtDatetime = ts => ts ? new Date(ts*1000).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
 const yesno = v => v ? '<span class="badge badge-green">●&thinsp;active</span>' : '<span class="badge badge-red">○&thinsp;inactive</span>';
 const provIcon = p => {
-  const m = {openrouter:'OR',kilo:'K',cerebras:'CB',groq:'GQ',buw:'BW'};
-  const c = {openrouter:'pi-openrouter',kilo:'pi-kilo',cerebras:'pi-cerebras',groq:'pi-groq',buw:'pi-buw'};
+  const m = {openrouter:'OR',kilo:'K',cerebras:'CB',groq:'GQ',sambanova:'SN',codestral:'CS',together:'TO',gemini:'G',mistral:'MS',llm7:'L7',nvidia:'NV'};
+  const c = {openrouter:'pi-openrouter',kilo:'pi-kilo',cerebras:'pi-cerebras',groq:'pi-groq',sambanova:'pi-sambanova',together:'pi-together'};
   return `<span class="prov-icon ${c[p]||'pi-other'}">${m[p]||p.substring(0,2).toUpperCase()}</span>`;
 };
 
@@ -714,16 +714,24 @@ async function renderPlayground(ca) {
   const realModels = models.filter(m => !['omrp/auto','omrp/auto-free'].includes(m.id));
   const hasKeys    = userKeys.some(k => k.is_active);
 
-  // Group models by provider
+  // Group models by provider for <optgroup> in dropdown
   const grouped = {};
   for (const m of realModels) {
-    const g = m.owned_by || 'other';
-    (grouped[g] = grouped[g]||[]).push(m);
+    const g = m.provider || m.owned_by || 'other';
+    (grouped[g] = grouped[g] || []).push(m);
   }
-  const modelOpts = realModels.sort((a,b)=>{
-    if (a.owned_by !== b.owned_by) return (a.owned_by||'').localeCompare(b.owned_by||'');
-    return a.id.localeCompare(b.id);
-  }).map(m => `<option value="${esc(m.id)}" data-prov="${esc(m.owned_by||'')}">${esc(m.id)}</option>`).join('');
+  // Build <optgroup> sections sorted alphabetically by provider name
+  const modelOpts = Object.keys(grouped).sort().map(prov => {
+    const provLabel = grouped[prov][0]?.provider_name || prov.toUpperCase();
+    const opts = grouped[prov]
+      .sort((a,b) => (a.display||a.id).localeCompare(b.display||b.id))
+      .map(m => {
+        // display field: "Provider — Creator — Label"  (e.g. "Groq — Meta — Llama 3.3 70B")
+        const label = m.display || `${m.owned_by||''} — ${m.id}`;
+        return `<option value="${esc(m.id)}" data-prov="${esc(m.provider||m.owned_by||'')}">${esc(label)}</option>`;
+      }).join('');
+    return `<optgroup label="${esc(prov.toUpperCase())}">${opts}</optgroup>`;
+  }).join('');
 
   ca.innerHTML = `
     <div style="display:flex;flex-direction:column;height:calc(100vh - var(--topbar-h) - 32px);gap:10px">
@@ -880,7 +888,7 @@ async function pgSend() {
     const res = await fetch('/v1/chat/completions',{
       method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+S.token},
-      body: JSON.stringify({model,messages:msgList,stream,max_tokens:2048}),
+      body: JSON.stringify({model,messages:msgList,stream,max_tokens:512}),
     });
 
     const omrpModel = res.headers.get('x-omrp-model') || '';
@@ -900,7 +908,7 @@ async function pgSend() {
     if (stream) {
       const reader  = res.body.getReader();
       const decoder = new TextDecoder();
-      let   buf = '', full = '';
+      let   buf = '', full = '', isErr = false;
       while(true) {
         const {done,value} = await reader.read();
         if (done) break;
@@ -910,16 +918,43 @@ async function pgSend() {
           if (!line.startsWith('data: ')) continue;
           const d = line.slice(6).trim();
           if (d==='[DONE]') { reader.cancel(); break; }
-          try { const chunk=JSON.parse(d); const delta=chunk.choices?.[0]?.delta?.content||''; if(delta){full+=delta;} } catch{}
+          try {
+            const chunk = JSON.parse(d);
+            // Provider error embedded in SSE stream
+            if (chunk.error) {
+              isErr = true;
+              full  = chunk.error.message || JSON.stringify(chunk.error);
+              break;
+            }
+            const delta = chunk.choices?.[0]?.delta?.content || '';
+            if (delta) full += delta;
+          } catch {}
         }
         document.getElementById(aiId+'-cur')?.remove();
-        document.getElementById(aiId+'-body').textContent = full;
-        const cur=document.createElement('span'); cur.className='cursor'; cur.id=aiId+'-cur';
-        document.getElementById(aiId+'-body').after(cur);
+        const bodyEl = document.getElementById(aiId+'-body');
+        if (bodyEl) {
+          bodyEl.textContent = full;
+          if (isErr) {
+            bodyEl.style.color = 'var(--red)';
+            // Suggest adding a key if it looks like a credentials problem
+            const needsKey = /credits|auth|key|token|discontinued|not found/i.test(full);
+            if (needsKey && !document.getElementById('pg-err-key-hint')) {
+              const hint = document.createElement('div');
+              hint.id = 'pg-err-key-hint';
+              hint.style.cssText = 'margin-top:8px;font-size:11px;color:var(--text2)';
+              hint.innerHTML = `<a href="#" onclick="nav('freeway');return false" style="color:var(--cyan)">
+                → Go to Free Providers to add or replace your key</a>`;
+              bodyEl.after(hint);
+            }
+          }
+        }
+        const cur = document.createElement('span'); cur.className='cursor'; cur.id=aiId+'-cur';
+        document.getElementById(aiId+'-body')?.after(cur);
         msgs.scrollTop = msgs.scrollHeight;
+        if (isErr) break;
       }
       document.getElementById(aiId+'-cur')?.remove();
-      if (full) pgHist.push({role:'assistant',content:full});
+      if (full && !isErr) pgHist.push({role:'assistant',content:full});
     } else {
       const data = await res.json();
       const txt  = data.choices?.[0]?.message?.content || '(empty)';
@@ -1422,7 +1457,7 @@ async function revokeKey(path, page) {
 
 async function renderProviderKeys(ca) {
   const {data:keys=[]} = await GET('/api/admin/provider-keys');
-  const KNOWN = ['openrouter','kilo','cerebras','groq','buw'];
+  const KNOWN = ['openrouter','kilo','cerebras','groq','sambanova','codestral','together'];
 
   // Collect all distinct providers (known + any custom ones added by admin)
   const allProviders = [...new Set([...KNOWN, ...keys.map(k=>k.provider)])];
@@ -1469,7 +1504,7 @@ async function renderProviderKeys(ca) {
 }
 
 function showCreatePKey(isAdmin) {
-  const PROVIDERS = ['openrouter','kilo','cerebras','groq','buw','custom'];
+  const PROVIDERS = ['openrouter','kilo','cerebras','groq','sambanova','codestral','together','custom'];
   const endpoint = isAdmin ? '/api/admin/provider-keys' : '/api/user/provider-keys';
   const doneNav  = isAdmin ? 'pkeys' : 'my-pkeys';
   openModal(`
@@ -2109,7 +2144,7 @@ function _fwDetail(id) {
 
 function _fwAddKey(id) {
   const p = _fwProviders.find(x=>x.id===id); if (!p) return;
-  const knownBuiltin = ['openrouter','groq','cerebras','kilo','buw'];
+  const knownBuiltin = ['openrouter','groq','cerebras','kilo','sambanova','codestral','together'];
   openModal(`
     <div class="modal-title">Add ${esc(p.name)}</div>
     <div style="margin-bottom:10px;font-size:12px;color:var(--text2)">
@@ -2372,7 +2407,7 @@ async function renderMyKeys(ca) {
 
 async function renderMyProviders(ca) {
   const {data:keys=[]} = await GET('/api/user/provider-keys');
-  const PROVIDERS = ['openrouter','kilo','cerebras','groq','buw'];
+  const PROVIDERS = ['openrouter','kilo','cerebras','groq','sambanova','codestral','together'];
   const byProv = Object.fromEntries(PROVIDERS.map(p => [p, keys.filter(k=>k.provider===p)]));
 
   ca.innerHTML = `

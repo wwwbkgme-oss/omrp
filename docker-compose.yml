@@ -1,0 +1,29 @@
+services:
+  omrp:
+    build: .
+    image: omrp:latest
+    container_name: omrp
+    restart: unless-stopped
+    ports:
+      - "18800:18800"
+    volumes:
+      # Persist the database and config beside the binary (inside /app)
+      - omrp-data:/app/db
+    environment:
+      # Paste provider API keys here (or use .env file / secrets manager)
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - CEREBRAS_API_KEY=${CEREBRAS_API_KEY:-}
+      - KILO_API_KEY=${KILO_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18800/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  omrp-data:

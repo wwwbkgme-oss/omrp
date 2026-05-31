@@ -1768,7 +1768,18 @@ async fn proxy_completions(
             .and_then(|k| std::env::var(k.api_key_env()).ok())
             .unwrap_or_default()
     });
-    let custom_url = custom_base_url; // rename for clarity in closures
+    let custom_url = custom_base_url;
+
+    // Strip the "{provider}/" prefix from the model ID before sending to the
+    // provider API. OpenRouter keeps full paths (meta-llama/…); all others
+    // expect bare model IDs (e.g. Groq wants "llama-3.3-70b-versatile" not
+    // "groq/llama-3.3-70b-versatile").
+    let model_for_provider: String = {
+        use crate::provider::ProviderKind;
+        ProviderKind::from_str(&prov)
+            .map(|pk| pk.normalize_model_id(&routed).to_string())
+            .unwrap_or_else(|| routed.clone())
+    };
 
     // ── STREAMING PATH (SSE) ─────────────────────────────────────────────────
     // When client sends "stream":true, pipe SSE bytes directly from provider.
@@ -1781,8 +1792,9 @@ async fn proxy_completions(
         let uid3 = uid_opt.clone(); let the_key3 = the_key_id.clone();
         let cust3 = custom_url.clone();
         let ubody = json!({
-            "model": routed, "messages": msgs,
-            "max_tokens": max_tokens.unwrap_or(2048), "stream": true,
+            // Use the normalised model ID (provider prefix stripped where needed)
+            "model": model_for_provider, "messages": msgs,
+            "max_tokens": max_tokens.unwrap_or(512), "stream": true,
         });
         task::spawn_blocking(move || {
             use std::io::Read;
@@ -1791,6 +1803,7 @@ async fn proxy_completions(
             let pa = use_bypass && !pool2.is_empty();
             let tot = if pa { 1 + 12usize.min(pool2.len()) } else { 1 };
             let mut pu = 0i64;
+            let mut last_err = String::from("Provider unavailable");
             for attempt in (if pa {1} else {0})..tot {
                 let c = if api3.is_empty() {
                     match CompatClient::for_provider(&prov3) { Ok(x)=>x, Err(_)=>break }
@@ -1819,12 +1832,25 @@ async fn proxy_completions(
                         }
                         return;
                     }
-                    Err(ProviderError::RateLimited{..}) => {}
-                    Err(ProviderError::Auth(_)) => break,
-                    Err(e) => { if pu>0{pool2.mark_failure(pu,&db3);} eprintln!("[stream] {}", format_provider_error(&e)); }
+                    Err(ProviderError::RateLimited{..}) => {
+                        last_err = format!("Rate limited on {prov3}. Trying next proxy…");
+                    }
+                    Err(ProviderError::Auth(msg)) => {
+                        last_err = format!("Auth error ({prov3}): {msg}");
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = format_provider_error(&e);
+                        eprintln!("[stream] {last_err}");
+                        if pu>0 { pool2.mark_failure(pu,&db3); }
+                    }
                 }
             }
-            let _ = pu; // suppress unused-assignment warning on loop exit
+            let _ = pu;
+            // All attempts failed — push an SSE error event so the browser can display it
+            let escaped = last_err.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ");
+            let sse_err = format!("data: {{\"error\":{{\"message\":\"{escaped}\",\"type\":\"provider_error\"}}}}\n\ndata: [DONE]\n\n");
+            let _ = tx.blocking_send(Ok(Bytes::from(sse_err)));
         });
         let stream = ReceiverStream::new(rx);
         return axum::response::Response::builder()
@@ -1916,7 +1942,8 @@ async fn proxy_completions(
 
             // ── Make the request ──────────────────────────────────────────────
             let started = std::time::Instant::now();
-            let res     = client.complete_with_retry(&routed, &msgs_typed, max_tokens);
+            // Use normalised model ID (provider prefix stripped where needed)
+            let res     = client.complete_with_retry(&model_for_provider, &msgs_typed, max_tokens);
             let latency = started.elapsed().as_millis() as i64;
 
             match res {
@@ -2013,43 +2040,69 @@ async fn proxy_completions(
 }
 
 /// `GET /v1/models` — list available models in OpenAI format.
+/// Extended fields: `creator`, `display` (for UI), `provider` (slug).
 async fn proxy_models(State(state): State<Arc<AppState>>) -> Response {
     let now = now_secs();
-    let uid: Option<String> = None; // /v1/models is public; no user-scoping needed
+    let uid: Option<String> = None; // public endpoint — no user scoping
 
-    // ── Always include omrp routing aliases ──────────────────────────────────
+    // ── OMRP routing aliases (always present) ────────────────────────────────
     let mut models = vec![
-        json!({"id":"omrp/auto",      "object":"model","created":now,"owned_by":"omrp"}),
-        json!({"id":"omrp/auto-free", "object":"model","created":now,"owned_by":"omrp"}),
+        json!({"id":"omrp/auto",      "object":"model","created":now,
+               "owned_by":"omrp","provider":"omrp",
+               "creator":"OMRP","display":"OMRP — omrp/auto (smart routing)"}),
+        json!({"id":"omrp/auto-free", "object":"model","created":now,
+               "owned_by":"omrp","provider":"omrp",
+               "creator":"OMRP","display":"OMRP — omrp/auto-free (smart routing)"}),
     ];
 
     // ── Config-file models (may be empty on fresh installs) ──────────────────
     let mut seen = std::collections::HashSet::<String>::new();
     for m in &state.cfg.model {
         if seen.insert(m.id.clone()) {
-            models.push(json!({"id": m.id, "object": "model", "created": now, "owned_by": m.provider}));
+            models.push(json!({
+                "id": m.id, "object": "model", "created": now,
+                "owned_by": m.provider, "provider": m.provider,
+                "creator": m.provider,
+                "display": format!("{} — {}", m.provider, m.id),
+            }));
         }
     }
 
-    // ── DB provider keys → add each provider's known free models ─────────────
-    // Only include models for providers that actually have an active key
-    // (either in the DB or as an environment variable).
-    use crate::provider::ProviderKind;
-    for prov in ProviderKind::all() {
+    // ── DB/env provider keys → add known free models with creator metadata ────
+    use crate::provider::{ProviderKind, FREE_PROVIDERS};
+    // Build a quick lookup: provider_id → FreeProvider
+    let fp_map: std::collections::HashMap<&str, &crate::provider::FreeProvider> =
+        FREE_PROVIDERS.iter().map(|p| (p.id, p)).collect();
+
+    for prov_kind in ProviderKind::all() {
+        let prov_id = prov_kind.to_str();
         let has_key = state.db
-            .resolve_provider_key(prov.to_str(), uid.as_deref())
+            .resolve_provider_key(prov_id, uid.as_deref())
             .unwrap_or(None)
             .is_some()
-            || std::env::var(prov.api_key_env()).is_ok();
+            || std::env::var(prov_kind.api_key_env()).is_ok();
 
         if has_key {
-            for (model_id, _hint) in prov.free_models() {
+            for (model_id, hint) in prov_kind.free_models() {
                 if seen.insert(model_id.to_string()) {
+                    // Look up richer metadata from FREE_PROVIDERS catalog
+                    let (creator, display) = if let Some(fp) = fp_map.get(prov_id) {
+                        if let Some(fm) = fp.models.iter().find(|m| m.id == *model_id) {
+                            (fm.creator, format!("{} — {} — {}", fp.name, fm.creator, fm.label))
+                        } else {
+                            (prov_id, format!("{} — {}", fp.name, hint))
+                        }
+                    } else {
+                        (prov_id, format!("{} — {}", prov_id, hint))
+                    };
                     models.push(json!({
                         "id":       model_id,
                         "object":   "model",
                         "created":  now,
-                        "owned_by": prov.to_str(),
+                        "owned_by": prov_id,
+                        "provider": prov_id,
+                        "creator":  creator,
+                        "display":  display,
                     }));
                 }
             }

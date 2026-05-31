@@ -19,38 +19,45 @@ const DEFAULT_MAX_TOKENS: u32 = 1024;
 // ─── Provider registry ────────────────────────────────────────────────────────
 
 /// Known OpenAI-compatible provider backends.
+/// BUW has been removed — `omrp/auto` provides the same smart-routing capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderKind {
-    /// https://openrouter.ai — OPENROUTER_API_KEY — 50-1000 free req/day
+    /// https://openrouter.ai — OPENROUTER_API_KEY
     OpenRouter,
-    /// https://kilo.ai — KILO_API_KEY — kilo/auto-free smart router
+    /// https://kilo.ai — KILO_API_KEY
     Kilo,
-    /// https://cloud.cerebras.ai — CEREBRAS_API_KEY — 14,400 req/day, wafer-fast
+    /// https://cloud.cerebras.ai — CEREBRAS_API_KEY
     Cerebras,
-    /// https://console.groq.com — GROQ_API_KEY — 1,000-14,400 req/day, ultra-low latency
+    /// https://console.groq.com — GROQ_API_KEY
     Groq,
-    /// https://api.buw.xyz — BUW_API_KEY — BUW virtual model gateway
-    Buw,
+    /// https://api.sambanova.ai — SAMBANOVA_API_KEY
+    SambaNova,
+    /// https://codestral.mistral.ai — CODESTRAL_API_KEY (Mistral code model, free Experiment plan)
+    Codestral,
+    /// https://api.together.xyz — TOGETHER_API_KEY
+    Together,
 }
 
 impl ProviderKind {
-    /// Resolve from the string stored in config (`provider = "groq"`)
-    /// or from a model id prefix (e.g. `"openrouter/auto"` → `openrouter`).
+    /// Resolve from a provider slug or model-id prefix.
+    /// Examples: `"groq"` → Groq; `"groq/llama-3.3-70b-versatile"` → Groq.
     pub fn from_str(s: &str) -> Option<Self> {
-        // Try exact provider name first, then extract prefix from model IDs
         let lower = s.to_lowercase();
         let prefix = lower.split('/').next().unwrap_or(&lower);
         match prefix {
-            "openrouter" => Some(Self::OpenRouter),
-            "kilo"       => Some(Self::Kilo),
-            "cerebras"   => Some(Self::Cerebras),
-            "groq"       => Some(Self::Groq),
-            "buw"        => Some(Self::Buw),
-            // well-known model families → infer provider
+            "openrouter"  => Some(Self::OpenRouter),
+            "kilo"        => Some(Self::Kilo),
+            "cerebras"    => Some(Self::Cerebras),
+            "groq"        => Some(Self::Groq),
+            "sambanova"   => Some(Self::SambaNova),
+            "codestral"   => Some(Self::Codestral),
+            "together"    => Some(Self::Together),
+            // well-known bare model IDs → infer provider
             "llama-3.3-70b-versatile" | "llama-3.1-8b-instant"
-            | "mixtral-8x7b-32768" | "qwen-qwq-32b"
-            | "gemma2-9b-it" => Some(Self::Groq),
-            "gpt-oss-120b" | "llama-3.3-70b" => Some(Self::Cerebras),
+            | "gemma2-9b-it" | "qwen-qwq-32b"
+            | "compound-beta"
+            | "mixtral-8x7b-32768"     => Some(Self::Groq),
+            "llama-3.3-70b" | "llama3.1-8b" | "gpt-oss-120b" => Some(Self::Cerebras),
             _ => None,
         }
     }
@@ -61,7 +68,9 @@ impl ProviderKind {
             Self::Kilo       => "https://api.kilo.ai/api/gateway",
             Self::Cerebras   => "https://api.cerebras.ai/v1",
             Self::Groq       => "https://api.groq.com/openai/v1",
-            Self::Buw        => "https://api.buw.xyz/v1",
+            Self::SambaNova  => "https://api.sambanova.ai/v1",
+            Self::Codestral  => "https://codestral.mistral.ai/v1",
+            Self::Together   => "https://api.together.xyz/v1",
         }
     }
 
@@ -71,7 +80,9 @@ impl ProviderKind {
             Self::Kilo       => "KILO_API_KEY",
             Self::Cerebras   => "CEREBRAS_API_KEY",
             Self::Groq       => "GROQ_API_KEY",
-            Self::Buw        => "BUW_API_KEY",
+            Self::SambaNova  => "SAMBANOVA_API_KEY",
+            Self::Codestral  => "CODESTRAL_API_KEY",
+            Self::Together   => "TOGETHER_API_KEY",
         }
     }
 
@@ -81,7 +92,9 @@ impl ProviderKind {
             Self::Kilo       => "kilo",
             Self::Cerebras   => "cerebras",
             Self::Groq       => "groq",
-            Self::Buw        => "buw",
+            Self::SambaNova  => "sambanova",
+            Self::Codestral  => "codestral",
+            Self::Together   => "together",
         }
     }
 
@@ -92,51 +105,88 @@ impl ProviderKind {
             Self::Kilo       => "Kilo Gateway",
             Self::Cerebras   => "Cerebras",
             Self::Groq       => "Groq",
-            Self::Buw        => "BUW",
+            Self::SambaNova  => "SambaNova",
+            Self::Codestral  => "Codestral (Mistral)",
+            Self::Together   => "Together AI",
         }
     }
 
-    /// Best free/default models to show in the playground when a key is configured.
-    /// Returned as (model_id, display_hint).
+    /// Free / default models for this provider, shown in the playground.
+    /// Tuple: (model_id_for_api, display_label_for_ui)
     pub fn free_models(&self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::OpenRouter => &[
-                ("openrouter/auto",                                    "OR smart router"),
-                ("meta-llama/llama-3.3-70b-instruct:free",             "Llama 3.3 70B free"),
-                ("mistralai/mistral-7b-instruct:free",                 "Mistral 7B free"),
-                ("google/gemma-3-12b-it:free",                         "Gemma 3 12B free"),
-                ("deepseek/deepseek-chat-v3-0324:free",                "DeepSeek v3 free"),
-                ("qwen/qwen3-8b:free",                                 "Qwen 3 8B free"),
-                ("openrouter/quasar-alpha",                            "Quasar Alpha free"),
+                // explicit :free models — no credits required
+                ("meta-llama/llama-3.3-70b-instruct:free",   "Meta — Llama 3.3 70B (free)"),
+                ("deepseek/deepseek-chat-v3-0324:free",      "DeepSeek — DeepSeek V3 (free)"),
+                ("google/gemma-3-27b-it:free",               "Google — Gemma 3 27B (free)"),
+                ("qwen/qwen3-8b:free",                       "Qwen — Qwen 3 8B (free)"),
+                ("mistralai/mistral-7b-instruct:free",       "Mistral AI — Mistral 7B (free)"),
+                ("openrouter/quasar-alpha",                  "OpenRouter — Quasar Alpha (free)"),
             ],
             Self::Groq => &[
-                ("llama-3.3-70b-versatile",  "Llama 3.3 70B"),
-                ("llama-3.1-8b-instant",     "Llama 3.1 8B"),
-                ("gemma2-9b-it",             "Gemma 2 9B"),
-                ("qwen-qwq-32b",             "Qwen QwQ 32B"),
+                ("llama-3.3-70b-versatile", "Meta — Llama 3.3 70B"),
+                ("llama-3.1-8b-instant",    "Meta — Llama 3.1 8B (fast)"),
+                ("gemma2-9b-it",            "Google — Gemma 2 9B"),
+                ("qwen-qwq-32b",            "Qwen — QwQ 32B (reasoning)"),
+                ("compound-beta",           "Groq — Compound Beta"),
             ],
             Self::Cerebras => &[
-                ("llama-3.3-70b",  "Llama 3.3 70B"),
-                ("llama3.1-8b",    "Llama 3.1 8B"),
+                ("llama-3.3-70b",  "Meta — Llama 3.3 70B (wafer-fast)"),
+                ("llama3.1-8b",    "Meta — Llama 3.1 8B (wafer-fast)"),
             ],
             Self::Kilo => &[
-                ("kilo/auto-free", "Kilo auto-free"),
+                ("kilo-auto/free", "Kilo — auto-free router"),
             ],
-            Self::Buw => &[
-                ("buw/auto", "BUW auto"),
+            Self::SambaNova => &[
+                ("Meta-Llama-3.3-70B-Instruct", "Meta — Llama 3.3 70B"),
+                ("Meta-Llama-3.1-8B-Instruct",  "Meta — Llama 3.1 8B"),
+                ("Qwen2.5-72B-Instruct",         "Qwen — Qwen 2.5 72B"),
+            ],
+            Self::Codestral => &[
+                ("codestral-latest", "Mistral — Codestral (code)"),
+                ("mistral-small-latest", "Mistral — Mistral Small"),
+            ],
+            Self::Together => &[
+                ("meta-llama/Llama-3.3-70B-Instruct-Turbo-Free", "Meta — Llama 3.3 70B (free)"),
+                ("meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo", "Meta — Llama 3.2 11B Vision (free)"),
+                ("deepseek-ai/DeepSeek-V3",                       "DeepSeek — DeepSeek V3"),
             ],
         }
     }
 
-    /// All known providers in priority order.
+    /// All built-in providers in priority order for auto-routing fallback.
     pub fn all() -> &'static [ProviderKind] {
         &[
             ProviderKind::OpenRouter,
             ProviderKind::Groq,
             ProviderKind::Cerebras,
             ProviderKind::Kilo,
-            ProviderKind::Buw,
+            ProviderKind::SambaNova,
+            ProviderKind::Codestral,
+            ProviderKind::Together,
         ]
+    }
+
+    /// Strip the `{provider}/` prefix from a model ID before sending to the provider API.
+    ///
+    /// Most providers use bare model IDs (e.g. Groq expects `llama-3.3-70b-versatile`
+    /// not `groq/llama-3.3-70b-versatile`). OpenRouter is an exception — it expects
+    /// the full `{creator}/{model}` format for its model routing.
+    ///
+    /// Rules:
+    /// - OpenRouter: keep as-is (they use `creator/model[:free]` natively)
+    /// - All others: if model starts with `{provider_slug}/`, strip it
+    pub fn normalize_model_id<'a>(&self, model_id: &'a str) -> &'a str {
+        if matches!(self, Self::OpenRouter) {
+            return model_id; // OpenRouter uses full paths like meta-llama/...
+        }
+        let prefix = format!("{}/", self.to_str());
+        if model_id.to_lowercase().starts_with(&prefix.to_lowercase()) {
+            &model_id[prefix.len()..]
+        } else {
+            model_id
+        }
     }
 }
 
@@ -148,41 +198,40 @@ impl ProviderKind {
 
 /// A single free-tier model entry within a provider.
 pub struct FreeModel {
-    pub id:          &'static str,
-    pub context_k:   u32,     // context window in K tokens
-    pub description: &'static str,
+    pub id:        &'static str,  // model ID sent verbatim to the provider API
+    pub creator:   &'static str,  // organisation that trained the model
+    pub context_k: u32,           // context window in K tokens
+    pub label:     &'static str,  // short display label, e.g. "Llama 3.3 70B"
 }
 
 /// Metadata for one free-tier LLM API provider.
 pub struct FreeProvider {
-    pub id:            &'static str,  // slug, used in OMRP as `provider` field
+    pub id:            &'static str,
     pub name:          &'static str,
     pub country_emoji: &'static str,
     pub base_url:      &'static str,
     pub signup_url:    &'static str,
-    pub key_env:       &'static str,  // env var name for the API key
-    pub free_note:     &'static str,  // one-liner describing the free tier
-    pub compat:        &'static str,  // "openai" | "openai+anthropic" | "custom"
+    pub key_env:       &'static str,
+    pub free_note:     &'static str,
     pub models:        &'static [FreeModel],
 }
 
 /// All known free-tier OpenAI-compatible LLM API providers.
+/// BUW removed — omrp/auto provides the same smart-routing capability.
 pub static FREE_PROVIDERS: &[FreeProvider] = &[
     FreeProvider {
         id: "openrouter", name: "OpenRouter", country_emoji: "🇺🇸",
         base_url: "https://openrouter.ai/api/v1",
         signup_url: "https://openrouter.ai/keys",
         key_env: "OPENROUTER_API_KEY",
-        free_note: "35+ models with :free suffix — no daily token cap on free models",
-        compat: "openai",
+        free_note: "35+ :free models — no daily cap, no credit card required",
         models: &[
-            FreeModel { id:"openrouter/auto",                                 context_k:200, description:"Smart routing" },
-            FreeModel { id:"meta-llama/llama-3.3-70b-instruct:free",          context_k:131, description:"Llama 3.3 70B" },
-            FreeModel { id:"deepseek/deepseek-chat-v3-0324:free",             context_k:164, description:"DeepSeek V3" },
-            FreeModel { id:"google/gemma-3-27b-it:free",                      context_k:128, description:"Gemma 3 27B" },
-            FreeModel { id:"qwen/qwen3-8b:free",                              context_k:128, description:"Qwen 3 8B" },
-            FreeModel { id:"mistralai/mistral-7b-instruct:free",              context_k:32,  description:"Mistral 7B" },
-            FreeModel { id:"openrouter/quasar-alpha",                         context_k:1000,description:"Quasar Alpha (1M ctx)" },
+            FreeModel { id:"meta-llama/llama-3.3-70b-instruct:free", creator:"Meta",       context_k:131, label:"Llama 3.3 70B" },
+            FreeModel { id:"deepseek/deepseek-chat-v3-0324:free",    creator:"DeepSeek",   context_k:164, label:"DeepSeek V3" },
+            FreeModel { id:"google/gemma-3-27b-it:free",             creator:"Google",     context_k:128, label:"Gemma 3 27B" },
+            FreeModel { id:"qwen/qwen3-8b:free",                     creator:"Qwen",       context_k:128, label:"Qwen 3 8B" },
+            FreeModel { id:"mistralai/mistral-7b-instruct:free",     creator:"Mistral AI", context_k:32,  label:"Mistral 7B" },
+            FreeModel { id:"openrouter/quasar-alpha",                creator:"OpenRouter", context_k:1000,label:"Quasar Alpha" },
         ],
     },
     FreeProvider {
@@ -190,14 +239,13 @@ pub static FREE_PROVIDERS: &[FreeProvider] = &[
         base_url: "https://api.groq.com/openai/v1",
         signup_url: "https://console.groq.com/keys",
         key_env: "GROQ_API_KEY",
-        free_note: "Free tier — ultra-low latency LPU inference, 1K–14K req/day per model",
-        compat: "openai",
+        free_note: "Ultra-low latency LPU inference — free tier, 1K–14K req/day",
         models: &[
-            FreeModel { id:"llama-3.3-70b-versatile",  context_k:128, description:"Llama 3.3 70B" },
-            FreeModel { id:"llama-3.1-8b-instant",      context_k:128, description:"Llama 3.1 8B (fast)" },
-            FreeModel { id:"gemma2-9b-it",              context_k:8,   description:"Gemma 2 9B" },
-            FreeModel { id:"qwen-qwq-32b",              context_k:128, description:"Qwen QwQ 32B (reasoning)" },
-            FreeModel { id:"compound-beta",             context_k:128, description:"Groq Compound Beta" },
+            FreeModel { id:"llama-3.3-70b-versatile", creator:"Meta",   context_k:128, label:"Llama 3.3 70B" },
+            FreeModel { id:"llama-3.1-8b-instant",    creator:"Meta",   context_k:128, label:"Llama 3.1 8B (fast)" },
+            FreeModel { id:"gemma2-9b-it",            creator:"Google", context_k:8,   label:"Gemma 2 9B" },
+            FreeModel { id:"qwen-qwq-32b",            creator:"Qwen",   context_k:128, label:"QwQ 32B (reasoning)" },
+            FreeModel { id:"compound-beta",           creator:"Groq",   context_k:128, label:"Compound Beta" },
         ],
     },
     FreeProvider {
@@ -205,11 +253,10 @@ pub static FREE_PROVIDERS: &[FreeProvider] = &[
         base_url: "https://api.cerebras.ai/v1",
         signup_url: "https://cloud.cerebras.ai/",
         key_env: "CEREBRAS_API_KEY",
-        free_note: "Free tier — wafer-scale chips, ~2600 tok/s, 1M tokens/day cap",
-        compat: "openai",
+        free_note: "Wafer-scale inference ~2600 tok/s — 1M tokens/day free",
         models: &[
-            FreeModel { id:"llama-3.3-70b",  context_k:128, description:"Llama 3.3 70B" },
-            FreeModel { id:"llama3.1-8b",    context_k:128, description:"Llama 3.1 8B" },
+            FreeModel { id:"llama-3.3-70b", creator:"Meta", context_k:128, label:"Llama 3.3 70B" },
+            FreeModel { id:"llama3.1-8b",   creator:"Meta", context_k:128, label:"Llama 3.1 8B" },
         ],
     },
     FreeProvider {
@@ -217,10 +264,44 @@ pub static FREE_PROVIDERS: &[FreeProvider] = &[
         base_url: "https://api.kilo.ai/api/gateway",
         signup_url: "https://kilo.ai",
         key_env: "KILO_API_KEY",
-        free_note: "Free models with no credit card — kilo/auto-free smart router",
-        compat: "openai",
+        free_note: "Free models, no credit card — kilo-auto/free smart router",
         models: &[
-            FreeModel { id:"kilo/auto-free", context_k:200, description:"Auto-router (free tier)" },
+            FreeModel { id:"kilo-auto/free", creator:"Kilo", context_k:200, label:"Auto-free router" },
+        ],
+    },
+    FreeProvider {
+        id: "sambanova", name: "SambaNova", country_emoji: "🇺🇸",
+        base_url: "https://api.sambanova.ai/v1",
+        signup_url: "https://cloud.sambanova.ai/",
+        key_env: "SAMBANOVA_API_KEY",
+        free_note: "Free tier — fast inference, no credit card",
+        models: &[
+            FreeModel { id:"Meta-Llama-3.3-70B-Instruct", creator:"Meta",  context_k:128, label:"Llama 3.3 70B" },
+            FreeModel { id:"Meta-Llama-3.1-8B-Instruct",  creator:"Meta",  context_k:16,  label:"Llama 3.1 8B" },
+            FreeModel { id:"Qwen2.5-72B-Instruct",        creator:"Qwen",  context_k:128, label:"Qwen 2.5 72B" },
+        ],
+    },
+    FreeProvider {
+        id: "codestral", name: "Codestral (Mistral)", country_emoji: "🇫🇷",
+        base_url: "https://codestral.mistral.ai/v1",
+        signup_url: "https://console.mistral.ai/api-keys",
+        key_env: "CODESTRAL_API_KEY",
+        free_note: "Free Experiment plan — optimised for code, 2 req/min",
+        models: &[
+            FreeModel { id:"codestral-latest",     creator:"Mistral AI", context_k:256, label:"Codestral (code)" },
+            FreeModel { id:"mistral-small-latest", creator:"Mistral AI", context_k:128, label:"Mistral Small" },
+        ],
+    },
+    FreeProvider {
+        id: "together", name: "Together AI", country_emoji: "🇺🇸",
+        base_url: "https://api.together.xyz/v1",
+        signup_url: "https://api.together.ai/",
+        key_env: "TOGETHER_API_KEY",
+        free_note: "Several permanently free models + $1 signup credit",
+        models: &[
+            FreeModel { id:"meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",   creator:"Meta",     context_k:131, label:"Llama 3.3 70B (free)" },
+            FreeModel { id:"meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo", creator:"Meta",     context_k:128, label:"Llama 3.2 11B Vision (free)" },
+            FreeModel { id:"deepseek-ai/DeepSeek-V3",                        creator:"DeepSeek", context_k:128, label:"DeepSeek V3" },
         ],
     },
     FreeProvider {
@@ -228,11 +309,10 @@ pub static FREE_PROVIDERS: &[FreeProvider] = &[
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         signup_url: "https://aistudio.google.com/app/apikey",
         key_env: "GEMINI_API_KEY",
-        free_note: "Free tier — not available in EU/UK/CH. Prompts may be used for improvement.",
-        compat: "openai",
+        free_note: "Free tier — 10 RPM / 250 RPD. Not in EU/UK/CH.",
         models: &[
-            FreeModel { id:"gemini-2.5-flash",      context_k:1000, description:"Gemini 2.5 Flash (10 RPM / 250 RPD)" },
-            FreeModel { id:"gemini-2.5-flash-lite",  context_k:1000, description:"Gemini 2.5 Flash-Lite (15 RPM / 1K RPD)" },
+            FreeModel { id:"gemini-2.5-flash",      creator:"Google", context_k:1000, label:"Gemini 2.5 Flash" },
+            FreeModel { id:"gemini-2.5-flash-lite", creator:"Google", context_k:1000, label:"Gemini 2.5 Flash-Lite" },
         ],
     },
     FreeProvider {
@@ -241,11 +321,9 @@ pub static FREE_PROVIDERS: &[FreeProvider] = &[
         signup_url: "https://console.mistral.ai/api-keys",
         key_env: "MISTRAL_API_KEY",
         free_note: "Free Experiment plan — no credit card, ~1B tokens/month",
-        compat: "openai",
         models: &[
-            FreeModel { id:"mistral-small-latest",    context_k:32,  description:"Mistral Small" },
-            FreeModel { id:"open-mistral-7b",         context_k:32,  description:"Mistral 7B (open)" },
-            FreeModel { id:"open-mixtral-8x7b",       context_k:32,  description:"Mixtral 8x7B (open)" },
+            FreeModel { id:"mistral-small-latest", creator:"Mistral AI", context_k:32, label:"Mistral Small" },
+            FreeModel { id:"open-mistral-7b",      creator:"Mistral AI", context_k:32, label:"Mistral 7B (open)" },
         ],
     },
     FreeProvider {
@@ -253,12 +331,10 @@ pub static FREE_PROVIDERS: &[FreeProvider] = &[
         base_url: "https://models.inference.ai.azure.com",
         signup_url: "https://github.com/marketplace/models",
         key_env: "GITHUB_TOKEN",
-        free_note: "Free for all GitHub users — 45+ models, per-request rate limits",
-        compat: "openai",
+        free_note: "Free for all GitHub users — 45+ models",
         models: &[
-            FreeModel { id:"gpt-4o-mini",                  context_k:128, description:"GPT-4o mini" },
-            FreeModel { id:"meta-llama-3.3-70b-instruct",  context_k:128, description:"Llama 3.3 70B" },
-            FreeModel { id:"mistral-large-latest",         context_k:128, description:"Mistral Large" },
+            FreeModel { id:"gpt-4o-mini",                  creator:"OpenAI", context_k:128, label:"GPT-4o mini" },
+            FreeModel { id:"meta-llama-3.3-70b-instruct",  creator:"Meta",   context_k:128, label:"Llama 3.3 70B" },
         ],
     },
     FreeProvider {
@@ -267,23 +343,9 @@ pub static FREE_PROVIDERS: &[FreeProvider] = &[
         signup_url: "https://token.llm7.io",
         key_env: "LLM7_API_KEY",
         free_note: "Zero-friction — no registration for basic access, 30+ models",
-        compat: "openai",
         models: &[
-            FreeModel { id:"gpt-4o",                        context_k:128, description:"GPT-4o compat" },
-            FreeModel { id:"claude-3-5-sonnet-20241022",    context_k:200, description:"Claude Sonnet compat" },
-        ],
-    },
-    FreeProvider {
-        id: "cohere", name: "Cohere", country_emoji: "🇨🇦",
-        base_url: "https://api.cohere.com/v2",
-        signup_url: "https://dashboard.cohere.com/api-keys",
-        key_env: "COHERE_API_KEY",
-        free_note: "Trial key, no credit card — 1,000 API calls/month, non-commercial",
-        compat: "openai",
-        models: &[
-            FreeModel { id:"command-a-03-2025",  context_k:256, description:"Command A 111B" },
-            FreeModel { id:"command-r-plus",     context_k:128, description:"Command R+" },
-            FreeModel { id:"command-r7b-12-2024",context_k:128, description:"Command R 7B" },
+            FreeModel { id:"gpt-4o",                     creator:"OpenAI",    context_k:128, label:"GPT-4o compat" },
+            FreeModel { id:"claude-3-5-sonnet-20241022", creator:"Anthropic", context_k:200, label:"Claude Sonnet compat" },
         ],
     },
     FreeProvider {
@@ -291,71 +353,33 @@ pub static FREE_PROVIDERS: &[FreeProvider] = &[
         base_url: "https://integrate.api.nvidia.com/v1",
         signup_url: "https://build.nvidia.com/explore/discover",
         key_env: "NVIDIA_API_KEY",
-        free_note: "Free with NVIDIA Developer Program — 100+ models, no daily token cap",
-        compat: "openai",
+        free_note: "Free with NVIDIA Developer Program — 100+ models",
         models: &[
-            FreeModel { id:"meta/llama-3.3-70b-instruct", context_k:128, description:"Llama 3.3 70B" },
-            FreeModel { id:"nvidia/llama-3.1-nemotron-ultra-253b-v1",context_k:128,description:"Nemotron Ultra 253B" },
-        ],
-    },
-    FreeProvider {
-        id: "siliconflow", name: "SiliconFlow", country_emoji: "🇨🇳",
-        base_url: "https://api.siliconflow.cn/v1",
-        signup_url: "https://cloud.siliconflow.cn/account/ak",
-        key_env: "SILICONFLOW_API_KEY",
-        free_note: "Signup credits + permanently free models available",
-        compat: "openai",
-        models: &[
-            FreeModel { id:"Qwen/Qwen2.5-7B-Instruct",           context_k:128, description:"Qwen 2.5 7B" },
-            FreeModel { id:"THUDM/glm-4-9b-chat",                context_k:128, description:"GLM-4 9B" },
-            FreeModel { id:"deepseek-ai/DeepSeek-V2.5",          context_k:128, description:"DeepSeek V2.5" },
-        ],
-    },
-    FreeProvider {
-        id: "cloudflare", name: "Cloudflare Workers AI", country_emoji: "🇺🇸",
-        base_url: "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
-        signup_url: "https://dash.cloudflare.com/profile/api-tokens",
-        key_env: "CLOUDFLARE_API_KEY",
-        free_note: "10,000 Neurons/day free — 50+ models, requires account_id in URL",
-        compat: "openai",
-        models: &[
-            FreeModel { id:"@cf/meta/llama-3.3-70b-instruct-fp8-fast", context_k:128, description:"Llama 3.3 70B fast" },
-            FreeModel { id:"@cf/google/gemma-3-12b-it",                 context_k:32,  description:"Gemma 3 12B" },
-        ],
-    },
-    FreeProvider {
-        id: "buw", name: "BUW Gateway", country_emoji: "🌐",
-        base_url: "https://api.buw.xyz/v1",
-        signup_url: "https://api.buw.xyz",
-        key_env: "BUW_API_KEY",
-        free_note: "BUW virtual model gateway",
-        compat: "openai",
-        models: &[
-            FreeModel { id:"buw/auto", context_k:200, description:"Auto-routing" },
+            FreeModel { id:"meta/llama-3.3-70b-instruct",             creator:"Meta",  context_k:128, label:"Llama 3.3 70B" },
+            FreeModel { id:"nvidia/llama-3.1-nemotron-ultra-253b-v1", creator:"NVIDIA",context_k:128, label:"Nemotron Ultra 253B" },
         ],
     },
 ];
 
-/// Serialise the entire catalog to a JSON array for the `/api/public/providers` endpoint.
+/// Serialise the catalog as JSON for the `/api/public/providers` endpoint.
 pub fn free_providers_json() -> serde_json::Value {
     use serde_json::json;
-    serde_json::Value::Array(
-        FREE_PROVIDERS.iter().map(|p| json!({
-            "id":           p.id,
-            "name":         p.name,
-            "country":      p.country_emoji,
-            "base_url":     p.base_url,
-            "signup_url":   p.signup_url,
-            "key_env":      p.key_env,
-            "free_note":    p.free_note,
-            "compat":       p.compat,
-            "models": p.models.iter().map(|m| json!({
-                "id":          m.id,
-                "context_k":   m.context_k,
-                "description": m.description,
-            })).collect::<Vec<_>>(),
-        })).collect()
-    )
+    serde_json::Value::Array(FREE_PROVIDERS.iter().map(|p| json!({
+        "id":         p.id,
+        "name":       p.name,
+        "country":    p.country_emoji,
+        "base_url":   p.base_url,
+        "signup_url": p.signup_url,
+        "key_env":    p.key_env,
+        "free_note":  p.free_note,
+        "models": p.models.iter().map(|m| json!({
+            "id":        m.id,
+            "creator":   m.creator,
+            "context_k": m.context_k,
+            "label":     m.label,
+            "display":   format!("{} — {}", m.creator, m.label),
+        })).collect::<Vec<_>>(),
+    })).collect())
 }
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -453,7 +477,9 @@ impl CompatClient {
                     ProviderKind::Kilo       => "https://kilo.ai",
                     ProviderKind::Cerebras   => "https://cloud.cerebras.ai",
                     ProviderKind::Groq       => "https://console.groq.com",
-                    ProviderKind::Buw        => "https://api.buw.xyz",
+                    ProviderKind::SambaNova  => "https://cloud.sambanova.ai/",
+                    ProviderKind::Codestral  => "https://console.mistral.ai/",
+                    ProviderKind::Together   => "https://api.together.ai/",
                 }
             )
         })?;
