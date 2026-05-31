@@ -281,8 +281,8 @@ tbody td{padding:10px 14px;font-size:13px;color:var(--text1);vertical-align:midd
       </div>
       <div class="topbar-right">
         <div id="tb-viewtoggle" style="display:none;gap:6px"></div>
-        <span class="status-dot"></span>
-        <span style="font-size:11px;color:var(--text2)">Connected</span>
+        <span class="status-dot" id="conn-dot"></span>
+        <span style="font-size:11px;color:var(--text2)" id="conn-label">Connected</span>
       </div>
     </div>
     <div id="content-area"></div>
@@ -305,21 +305,55 @@ tbody td{padding:10px 14px;font-size:13px;color:var(--text1);vertical-align:midd
 const S = { user:null, token:null, page:'', appName:'OMRP', adminViewAsUser:false };
 
 // ── API ────────────────────────────────────────────────────────────
+let _apiInflight = 0; // global in-flight counter for loading UI
+
 async function api(method, path, body, raw=false) {
   const headers = { 'Content-Type': 'application/json' };
   if (S.token) headers['Authorization'] = 'Bearer ' + S.token;
-  const res = await fetch(path, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (raw) return res;
-  return res.json().catch(() => ({ error: { message: 'Network error' } }));
+  try {
+    const res = await fetch(path, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    // Auto-logout on 401 (token expired or revoked)
+    if (res.status === 401 && path !== '/api/auth/login') {
+      S.token = null; S.user = null;
+      localStorage.removeItem('omrp_token');
+      localStorage.removeItem('omrp_user');
+      show('pg-login');
+      toast('Session expired — please log in again', 'err', 5000);
+      return { error: { message: 'Session expired', code: 401 } };
+    }
+    if (raw) return res;
+    const data = await res.json().catch(() => ({ error: { message: `HTTP ${res.status}` } }));
+    // Surface server errors as toasts only for non-GET requests where user expects feedback
+    if (data?.error && method !== 'GET') {
+      // Caller handles the error display; we just return the data
+    }
+    return data;
+  } catch(e) {
+    // Network error (server unreachable, timeout, etc.)
+    const msg = navigator.onLine ? 'Server unreachable' : 'No internet connection';
+    if (method !== 'GET') toast(msg, 'err');
+    return { error: { message: msg } };
+  }
 }
-const GET  = (p) => api('GET',    p);
+const GET  = (p)    => api('GET',    p);
 const POST = (p, b) => api('POST',   p, b);
 const PUT  = (p, b) => api('PUT',    p, b);
-const DEL  = (p) => api('DELETE', p);
+const DEL  = (p)    => api('DELETE', p);
+
+// ── Loading button helper ──────────────────────────────────────────
+// Usage: const done = loadBtn('btn-id'); ... await action(); done();
+function loadBtn(id, label='…') {
+  const el = document.getElementById(id);
+  if (!el) return ()=>{};
+  const orig = el.innerHTML;
+  el.disabled = true;
+  el.innerHTML = `<span class="spinner" style="width:14px;height:14px;border-width:2px;display:inline-block"></span> ${label}`;
+  return () => { el.disabled = false; el.innerHTML = orig; };
+}
 
 // ── Toast ──────────────────────────────────────────────────────────
 function toast(msg, type='ok', ms=3000) {
@@ -1780,12 +1814,16 @@ function goToLogin() {
 // ═══════════════════════════════════════════════════════════════════
 
 async function doLogin() {
-  const user = document.getElementById('l-user').value.trim();
-  const pass = document.getElementById('l-pass').value;
+  const user  = document.getElementById('l-user').value.trim();
+  const pass  = document.getElementById('l-pass').value;
   const errEl = document.getElementById('login-err');
   errEl.style.display = 'none';
   if (!user || !pass) { errEl.style.display='block'; errEl.textContent='Please fill in both fields'; return; }
+  const btn  = document.querySelector('#pg-login button');
+  const orig = btn?.innerHTML;
+  if (btn) { btn.disabled=true; btn.innerHTML='Signing in…'; }
   const r = await POST('/api/auth/login', {username:user, password:pass});
+  if (btn) { btn.disabled=false; btn.innerHTML=orig||'Sign In'; }
   if (r.error) { errEl.style.display='block'; errEl.textContent=r.error.message; return; }
   S.token = r.token;
   S.user  = { user_id: r.user_id, username: r.username, is_admin: r.is_admin };
@@ -1876,6 +1914,37 @@ document.addEventListener('keydown', e => {
 
 // Boot
 boot();
+
+// ── Connection monitor ────────────────────────────────────────────
+// Polls /health every 30s; updates the status dot in the topbar.
+function updateConnStatus(online) {
+  const dot   = document.getElementById('conn-dot');
+  const label = document.getElementById('conn-label');
+  if (!dot || !label) return;
+  dot.style.background   = online ? 'var(--green)' : 'var(--red)';
+  dot.style.boxShadow    = online ? 'var(--glow-green)' : '0 0 8px var(--red)30';
+  label.textContent      = online ? 'Connected' : 'Offline';
+  label.style.color      = online ? 'var(--text2)' : 'var(--red)';
+}
+
+async function checkHealth() {
+  try {
+    const r = await fetch('/health');
+    updateConnStatus(r.ok);
+  } catch {
+    updateConnStatus(false);
+  }
+}
+
+// Check on visibility change (tab switch / wake-from-sleep)
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) checkHealth();
+});
+window.addEventListener('online',  () => updateConnStatus(true));
+window.addEventListener('offline', () => updateConnStatus(false));
+
+// Periodic check every 30s (only when page is visible)
+setInterval(() => { if (!document.hidden) checkHealth(); }, 30_000);
 </script>
 </body>
 </html>

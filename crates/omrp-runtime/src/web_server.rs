@@ -1662,11 +1662,17 @@ async fn proxy_models(State(state): State<Arc<AppState>>) -> Response {
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 
-async fn health() -> Response {
-    ok(json!({
-        "status":  "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    // Ping the DB by running a trivial query
+    let db_ok = state.db.get_setting("app.name").is_ok();
+    let db_status = if db_ok { "ok" } else { "error" };
+    let status_code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (status_code, Json(json!({
+        "status":     db_status,
+        "db":         db_status,
+        "version":    env!("CARGO_PKG_VERSION"),
+        "proxy_pool": state.proxy_pool.len(),
+    }))).into_response()
 }
 
 async fn server_stats(State(state): State<Arc<AppState>>) -> Response {
