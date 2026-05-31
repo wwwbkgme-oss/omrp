@@ -159,7 +159,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/news",     get(admin_list_news).post(admin_create_news))
         .route("/api/admin/news/:id", put(admin_update_news).delete(admin_delete_news))
         // ── Public: announcements (no auth) ───────────────────────────────────
-        .route("/api/public/news", get(public_news))
+        .route("/api/public/news",      get(public_news))
+        .route("/api/public/providers", get(public_providers))
         // ── User: own key + permissions ────────────────────────────────────────
         .route("/api/user/key",         get(user_get_key))
         .route("/api/user/key/reset",   post(user_reset_own_key))
@@ -2037,7 +2038,10 @@ async fn proxy_models(State(state): State<Arc<AppState>>) -> Response {
 
 // ─── Announcements / News ────────────────────────────────────────────────────
 
-/// `GET /api/public/news` — published announcements (no auth required).
+/// `GET /api/public/providers` — full free-tier provider catalog (no auth).
+async fn public_providers() -> Response {
+    ok(json!({ "data": crate::provider::free_providers_json() }))
+}
 async fn public_news(State(state): State<Arc<AppState>>) -> Response {
     match state.db.list_announcements(true) {
         Ok(news) => ok(json!({ "data": news.iter().map(|n| json!({
