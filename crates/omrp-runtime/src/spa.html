@@ -440,7 +440,8 @@ const ADMIN_PAGES = [
   { id:'models',     icon:'◉', label:'Models'            },
 ];
 const USER_PAGES = [
-  { id:'my-keys',    icon:'⌗', label:'My API Keys'    },
+  { id:'playground', icon:'⚡', label:'Playground'      },
+  { id:'my-keys',    icon:'⌗', label:'My API Key'     },
   { id:'my-pkeys',   icon:'⊟', label:'My Providers'   },
   { id:'my-stats',   icon:'∿', label:'Usage'           },
   { id:'my-profile', icon:'◎', label:'Profile'         },
@@ -1558,14 +1559,29 @@ async function renderMyKeys(ca) {
     <!-- ── Key card ── -->
     ${key.id ? `
     <div class="card" style="margin-bottom:16px">
-      <div class="card-header"><div class="card-title">Your API Key</div></div>
+      <div class="card-header">
+        <div class="card-title">Your API Key</div>
+        <button class="btn btn-danger" style="font-size:12px;padding:5px 12px" onclick="resetOwnKey()" id="btn-reset-key">
+          ↻ Regenerate
+        </button>
+      </div>
       <div class="card-body">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
           <div style="flex:1">
             <div style="font-size:13px;font-weight:600">${esc(key.label||'account-default')}</div>
-            <div style="font-family:var(--mono);font-size:12px;color:var(--cyan)">${prefix}… <span style="color:var(--text2);font-family:var(--sans)">(prefix — full key was shown at account creation)</span></div>
+            <div style="font-family:var(--mono);font-size:12px;color:var(--cyan)">${prefix}…
+              <span style="color:var(--text2);font-family:var(--sans)">(prefix — full key shown at creation)</span>
+            </div>
           </div>
           <div>${yesno(key.is_active)}</div>
+        </div>
+        <div id="my-key-reveal" style="display:none;margin-bottom:12px;background:var(--green-dim);border:1px solid var(--green)40;border-radius:var(--r6);padding:12px">
+          <div style="font-size:12px;color:var(--green);font-weight:600;margin-bottom:6px">⚠ New key — copy it now, it won't be shown again</div>
+          <div class="key-box">
+            <span class="key-val" id="my-key-val"></span>
+            <button class="btn btn-success" style="padding:6px 12px;font-size:12px"
+              onclick="navigator.clipboard.writeText(document.getElementById('my-key-val').textContent).then(()=>toast('Copied!'))">Copy</button>
+          </div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;color:var(--text2)">
           <div><strong style="color:var(--text1)">Created:</strong> ${fmtDate(key.created_at)}</div>
@@ -1892,7 +1908,23 @@ async function doLogout() {
   show('pg-login');
 }
 
-// ── Self-registration ───────────────────────────────────────────────
+// ── User self-service key reset ─────────────────────────────────────
+async function resetOwnKey() {
+  if (!confirm('Regenerate your API key? Your current key will stop working immediately.')) return;
+  const done = loadBtn('btn-reset-key', 'Regenerating…');
+  const r = await POST('/api/user/key/reset');
+  done();
+  if (r.error) { toast(r.error.message, 'err'); return; }
+  // Show the new key inline without reloading the whole page
+  const revealEl = document.getElementById('my-key-reveal');
+  const valEl    = document.getElementById('my-key-val');
+  if (revealEl && valEl) {
+    valEl.textContent    = r.api_key;
+    revealEl.style.display = 'block';
+    revealEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  toast('Key regenerated — copy it now!', 'ok', 8000);
+}
 function showRegister() {
   document.getElementById('reg-panel').style.display = 'block';
   document.getElementById('r-user').focus();
@@ -1932,7 +1964,7 @@ function startApp() {
     : '<span class="sb-badge user">user</span>';
   buildNav();
   show('pg-app');
-  const defaultPage = S.user.is_admin ? 'dashboard' : 'my-keys';
+  const defaultPage = S.user.is_admin ? 'dashboard' : 'playground';
   nav(defaultPage);
 }
 

@@ -155,6 +155,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/proxies/stats", get(admin_proxy_stats))
         // ── User: own key + permissions ────────────────────────────────────────
         .route("/api/user/key",         get(user_get_key))
+        .route("/api/user/key/reset",   post(user_reset_own_key))
         .route("/api/user/permissions", get(user_get_permissions))
         // ── User: personal API keys ────────────────────────────────────────────
         .route("/api/user/api-keys",     get(user_list_api_keys).post(user_create_api_key))
@@ -1288,6 +1289,42 @@ async fn user_get_permissions(
         Ok(Some(k)) => ok(json!(ApiKeyPermissions::from_json(&k.permissions))),
         Ok(None)    => ok(json!(ApiKeyPermissions::default())),
         Err(e)      => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `POST /api/user/key/reset`
+///
+/// Invalidates the caller's current API key and generates a new one with the
+/// same permissions.  The new key is returned **once** in plain text — it is
+/// not stored; only the SHA-256 hash is kept in the database.
+async fn user_reset_own_key(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+) -> Response {
+    let ts = now_secs() as i64;
+
+    // Keep the existing permissions so the reset is non-destructive
+    let old_perms = state.db.get_user_api_key(&user.user_id)
+        .ok().flatten()
+        .map(|k| ApiKeyPermissions::from_json(&k.permissions))
+        .unwrap_or_default();
+
+    // Revoke all existing keys for this user
+    if let Ok(keys) = state.db.get_user_api_key(&user.user_id) {
+        if let Some(k) = keys {
+            let _ = state.db.deactivate_api_key(&k.id);
+        }
+    }
+
+    // Issue a fresh key with the same permissions
+    match state.db.create_user_api_key(&user.user_id, "account-default", &old_perms) {
+        Ok((_, raw_key)) => {
+            let _ = state.db.audit(Some(&user.user_id), "user.key.reset", None, None, None, None, ts);
+            (StatusCode::CREATED, Json(json!({
+                "api_key": raw_key,
+                "note":    "Save this key — it will NOT be shown again.",
+            }))).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 
