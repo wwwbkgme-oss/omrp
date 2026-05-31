@@ -155,6 +155,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/users/:id/key/reset",        post(admin_reset_user_key))
         // ── Admin: proxy usage stats ──────────────────────────────────────────
         .route("/api/admin/proxies/stats", get(admin_proxy_stats))
+        // ── Admin: announcements / news ───────────────────────────────────────
+        .route("/api/admin/news",     get(admin_list_news).post(admin_create_news))
+        .route("/api/admin/news/:id", put(admin_update_news).delete(admin_delete_news))
+        // ── Public: announcements (no auth) ───────────────────────────────────
+        .route("/api/public/news", get(public_news))
         // ── User: own key + permissions ────────────────────────────────────────
         .route("/api/user/key",         get(user_get_key))
         .route("/api/user/key/reset",   post(user_reset_own_key))
@@ -2030,6 +2035,95 @@ async fn proxy_models(State(state): State<Arc<AppState>>) -> Response {
     ok(json!({ "object": "list", "data": models }))
 }
 
+// ─── Announcements / News ────────────────────────────────────────────────────
+
+/// `GET /api/public/news` — published announcements (no auth required).
+async fn public_news(State(state): State<Arc<AppState>>) -> Response {
+    match state.db.list_announcements(true) {
+        Ok(news) => ok(json!({ "data": news.iter().map(|n| json!({
+            "id":         n.id,
+            "title":      n.title,
+            "body":       n.body,
+            "is_pinned":  n.is_pinned,
+            "created_at": n.created_at,
+        })).collect::<Vec<_>>() })),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `GET /api/admin/news` — all announcements (admin auth required).
+async fn admin_list_news(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    match state.db.list_announcements(false) {
+        Ok(news) => ok(json!({ "data": news.iter().map(|n| json!({
+            "id":           n.id,
+            "title":        n.title,
+            "body":         n.body,
+            "is_pinned":    n.is_pinned,
+            "is_published": n.is_published,
+            "author_id":    n.author_id,
+            "created_at":   n.created_at,
+            "updated_at":   n.updated_at,
+        })).collect::<Vec<_>>() })),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct NewsRequest {
+    title:        String,
+    body:         Option<String>,
+    is_pinned:    Option<bool>,
+    is_published: Option<bool>,
+}
+
+/// `POST /api/admin/news`
+async fn admin_create_news(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Json(req): Json<NewsRequest>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    if req.title.trim().is_empty() { return err(StatusCode::BAD_REQUEST, "title required"); }
+    match state.db.create_announcement(
+        req.title.trim(), req.body.as_deref().unwrap_or(""),
+        Some(&user.user_id), req.is_pinned.unwrap_or(false),
+    ) {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `PUT /api/admin/news/:id`
+async fn admin_update_news(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Path(id): Path<i64>, Json(req): Json<NewsRequest>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    match state.db.update_announcement(
+        id, req.title.trim(), req.body.as_deref().unwrap_or(""),
+        req.is_pinned.unwrap_or(false), req.is_published.unwrap_or(true),
+    ) {
+        Ok(true)  => ok(json!({ "status": "ok" })),
+        Ok(false) => err(StatusCode::NOT_FOUND, "announcement not found"),
+        Err(e)    => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `DELETE /api/admin/news/:id`
+async fn admin_delete_news(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    match state.db.delete_announcement(id) {
+        Ok(true)  => ok(json!({ "status": "ok" })),
+        Ok(false) => err(StatusCode::NOT_FOUND, "announcement not found"),
+        Err(e)    => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 // ─── Health ───────────────────────────────────────────────────────────────────
 
 async fn health(State(state): State<Arc<AppState>>) -> Response {
@@ -2073,14 +2167,16 @@ fn serialize_api_key(k: &ApiKeyRow) -> Value {
 
 fn serialize_provider_key(k: &ProviderKeyRow) -> Value {
     json!({
-        "id":         k.id,
-        "user_id":    k.user_id,
-        "provider":   k.provider,
-        "label":      k.label,
-        "is_active":  k.is_active,
-        "is_global":  k.is_global,
-        "created_at": k.created_at,
-        // key_value intentionally omitted
+        "id":           k.id,
+        "user_id":      k.user_id,
+        "provider":     k.provider,
+        "display_name": k.display_name,
+        "base_url":     k.base_url,
+        "label":        k.label,
+        "is_active":    k.is_active,
+        "is_global":    k.is_global,
+        "created_at":   k.created_at,
+        // key_value intentionally omitted — never exposed over the API
     })
 }
 
