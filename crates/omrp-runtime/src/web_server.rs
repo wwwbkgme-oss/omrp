@@ -248,10 +248,24 @@ async fn auth_login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
 ) -> Response {
+    use crate::db::MAX_FAILED_LOGINS;
+
+    // ── Brute-force guard ──────────────────────────────────────────────────────
+    // Check BEFORE running Argon2 to prevent both enumeration and CPU exhaustion.
+    if let Ok(Some(secs)) = state.db.login_lockout_secs(&req.username) {
+        let mins = (secs + 59) / 60;
+        return err(StatusCode::TOO_MANY_REQUESTS,
+            format!("Account temporarily locked after {MAX_FAILED_LOGINS} failed attempts. \
+                     Try again in {mins} minute(s)."));
+    }
+
     let expiry: u64 = state.db.get_setting("jwt.expiry_secs").ok().flatten()
         .and_then(|s| s.parse().ok()).unwrap_or(86400);
     match authenticate(&state.db, &req.username, &req.password, &state.jwt_secret, expiry) {
         Ok(resp) => {
+            // Successful login: clear any recorded failed attempts
+            let _ = state.db.clear_login_attempts(&req.username);
+            let _ = state.db.audit(Some(&resp.user_id), "auth.login", None, None, None, None, now_secs() as i64);
             let cookie = auth_cookie(&resp.token, expiry);
             let mut headers = HeaderMap::new();
             if let Ok(v) = cookie.parse::<HeaderValue>() { headers.insert("Set-Cookie", v); }
@@ -262,11 +276,22 @@ async fn auth_login(
                 "is_admin": resp.is_admin,
             }))).into_response()
         }
-        Err(e) => err(StatusCode::UNAUTHORIZED, e),
+        Err(e) => {
+            // Failed login: record attempt (may lock the account)
+            let _ = state.db.record_failed_login(&req.username);
+            let _ = state.db.audit(None, "auth.login.failed", None, None, Some(&req.username), None, now_secs() as i64);
+            err(StatusCode::UNAUTHORIZED, e)
+        }
     }
 }
 
-async fn auth_logout() -> Response {
+async fn auth_logout(
+    State(state): State<Arc<AppState>>,
+    user: MaybeAuthUser,
+) -> Response {
+    if let Some(u) = &user.0 {
+        let _ = state.db.audit(Some(&u.user_id), "auth.logout", None, None, None, None, now_secs() as i64);
+    }
     let mut headers = HeaderMap::new();
     if let Ok(v) = logout_cookie().parse::<HeaderValue>() { headers.insert("Set-Cookie", v); }
     (StatusCode::OK, headers, Json(json!({ "status": "ok" }))).into_response()

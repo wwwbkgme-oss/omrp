@@ -108,7 +108,7 @@ impl Database {
     pub fn migrate(&self) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SCHEMA_SQL)?;
-        // Additive column migrations (safe to run multiple times)
+        // Additive column migrations (safe to run multiple times — errors silently ignored)
         let _ = conn.execute("ALTER TABLE api_keys ADD COLUMN permissions TEXT NOT NULL DEFAULT '{}'", []);
         let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN proxy_id INTEGER", []);
         let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN proxy_url TEXT", []);
@@ -264,6 +264,15 @@ CREATE TABLE IF NOT EXISTS proxies (
     uptime_pct  REAL    NOT NULL DEFAULT 100.0,
     fail_count  INTEGER NOT NULL DEFAULT 0,
     added_at    INTEGER NOT NULL
+);
+-- Brute-force login protection
+-- key = 'u:<username>' for per-account or 'i:<ip>' for per-IP tracking
+CREATE TABLE IF NOT EXISTS login_attempts (
+    key          TEXT    PRIMARY KEY,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    first_at     INTEGER NOT NULL,
+    last_at      INTEGER NOT NULL,
+    locked_until INTEGER NOT NULL DEFAULT 0  -- unix secs; 0 = not locked
 );
 ";
 
@@ -1093,6 +1102,72 @@ impl Database {
     }
 }
 
+// ─── Brute-force login protection ────────────────────────────────────────────
+
+/// Maximum failed attempts before account lock.
+pub const MAX_FAILED_LOGINS: i64   = 5;
+/// Lock duration in seconds after MAX_FAILED_LOGINS exceeded.
+pub const LOGIN_LOCK_SECS:   i64   = 15 * 60; // 15 minutes
+/// Window (seconds) within which attempts are counted.
+pub const LOGIN_WINDOW_SECS: i64   = 10 * 60; // 10 minutes
+
+impl Database {
+    /// Check whether a username is currently locked out.
+    /// Returns `Some(secs_remaining)` if locked, `None` if OK to attempt.
+    pub fn login_lockout_secs(&self, username: &str) -> SqlResult<Option<i64>> {
+        let key  = format!("u:{}", username.to_lowercase());
+        let now  = now_secs();
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(i64, i64)> = conn.query_row(
+            "SELECT attempts, locked_until FROM login_attempts WHERE key=?1",
+            params![key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).ok();
+        Ok(match row {
+            Some((_, locked_until)) if locked_until > now => Some(locked_until - now),
+            _ => None,
+        })
+    }
+
+    /// Record a failed login attempt.
+    /// Locks the account if MAX_FAILED_LOGINS is reached within LOGIN_WINDOW_SECS.
+    pub fn record_failed_login(&self, username: &str) -> SqlResult<()> {
+        let key  = format!("u:{}", username.to_lowercase());
+        let now  = now_secs();
+        let conn = self.conn.lock().unwrap();
+        // Upsert the attempt record
+        conn.execute(
+            "INSERT INTO login_attempts (key, attempts, first_at, last_at, locked_until)
+             VALUES (?1, 1, ?2, ?2, 0)
+             ON CONFLICT(key) DO UPDATE SET
+               attempts = CASE
+                 WHEN last_at < ?2 - ?3 THEN 1  -- reset: outside window
+                 ELSE attempts + 1
+               END,
+               first_at = CASE WHEN last_at < ?2 - ?3 THEN ?2 ELSE first_at END,
+               last_at  = ?2,
+               locked_until = CASE
+                 WHEN (CASE WHEN last_at < ?2 - ?3 THEN 1 ELSE attempts + 1 END) >= ?4
+                 THEN ?2 + ?5
+                 ELSE locked_until
+               END",
+            params![key, now, LOGIN_WINDOW_SECS, MAX_FAILED_LOGINS, LOGIN_LOCK_SECS],
+        )?;
+        Ok(())
+    }
+
+    /// Clear failed login attempts on successful authentication.
+    pub fn clear_login_attempts(&self, username: &str) -> SqlResult<()> {
+        let key  = format!("u:{}", username.to_lowercase());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM login_attempts WHERE key=?1",
+            params![key],
+        )?;
+        Ok(())
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1198,5 +1273,53 @@ mod tests {
         db.mark_proxy_result(1, false, None, ts).unwrap();
         // Still active after 1 failure
         assert_eq!(db.proxy_count().unwrap(), 1);
+    }
+
+    // ── Brute-force protection ────────────────────────────────────────────────
+
+    #[test]
+    fn test_no_lockout_initially() {
+        let db = mem_db();
+        assert_eq!(db.login_lockout_secs("alice").unwrap(), None);
+    }
+
+    #[test]
+    fn test_lockout_after_max_attempts() {
+        let db = mem_db();
+        // First (MAX_FAILED_LOGINS - 1) calls must NOT trigger the lock
+        for i in 0..MAX_FAILED_LOGINS - 1 {
+            db.record_failed_login("bob").unwrap();
+            assert!(
+                db.login_lockout_secs("bob").unwrap().is_none(),
+                "should not be locked after {} failure(s)", i + 1
+            );
+        }
+        // The MAX_FAILED_LOGINS-th call pushes attempts to the threshold → lock
+        db.record_failed_login("bob").unwrap();
+        let remaining = db.login_lockout_secs("bob").unwrap();
+        assert!(remaining.is_some(), "should be locked after {} failures", MAX_FAILED_LOGINS);
+        assert!(remaining.unwrap() > 0, "lock duration must be positive");
+    }
+
+    #[test]
+    fn test_clear_login_attempts_unlocks() {
+        let db = mem_db();
+        for _ in 0..=MAX_FAILED_LOGINS {
+            db.record_failed_login("carol").unwrap();
+        }
+        assert!(db.login_lockout_secs("carol").unwrap().is_some());
+        db.clear_login_attempts("carol").unwrap();
+        assert_eq!(db.login_lockout_secs("carol").unwrap(), None);
+    }
+
+    #[test]
+    fn test_lockout_case_insensitive() {
+        let db = mem_db();
+        for _ in 0..=MAX_FAILED_LOGINS {
+            db.record_failed_login("Dave").unwrap();
+        }
+        // Lower-case lookup should find the same record
+        assert!(db.login_lockout_secs("dave").unwrap().is_some());
+        assert!(db.login_lockout_secs("DAVE").unwrap().is_some());
     }
 }
