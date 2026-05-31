@@ -288,6 +288,133 @@ tbody td{padding:10px 14px;font-size:13px;color:var(--text1);vertical-align:midd
   </div>
 </div>
 
+<!-- Landing page (public, shown before login) -->
+<div id="pg-landing" style="display:none;min-height:100vh;background:var(--bg0);overflow-y:auto">
+
+  <!-- Navbar -->
+  <nav style="position:sticky;top:0;z-index:100;background:var(--bg0)cc;backdrop-filter:blur(12px);border-bottom:1px solid var(--border);padding:0 32px;height:56px;display:flex;align-items:center;gap:16px">
+    <div style="display:flex;align-items:center;gap:10px;flex:1">
+      <span style="font-size:20px;filter:drop-shadow(0 0 8px var(--cyan)50)">⚡</span>
+      <span id="land-appname" style="font-size:16px;font-weight:700;color:var(--text0);letter-spacing:.5px">OMRP</span>
+      <span style="font-size:11px;padding:2px 7px;border-radius:10px;background:var(--cyan-dim);color:var(--cyan);border:1px solid var(--cyan)30;margin-left:4px">v0.2</span>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-ghost" style="font-size:13px" onclick="show('pg-login')">Sign In</button>
+      <button id="land-register-btn" class="btn btn-primary" style="font-size:13px;display:none" onclick="show('pg-login');showRegister()">Get Started Free</button>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section style="padding:80px 32px 60px;max-width:900px;margin:0 auto;text-align:center">
+    <div style="display:inline-block;padding:5px 14px;border-radius:20px;border:1px solid var(--cyan)30;background:var(--cyan-dim);color:var(--cyan);font-size:11px;font-weight:600;letter-spacing:.5px;margin-bottom:24px;text-transform:uppercase">
+      Open Model Routing Protocol
+    </div>
+    <h1 id="land-tagline" style="font-size:clamp(2rem,5vw,3.5rem);font-weight:800;line-height:1.15;color:var(--text0);margin-bottom:20px">
+      The Intelligent LLM<br><span style="background:linear-gradient(90deg,var(--cyan),var(--blue));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Routing Engine</span>
+    </h1>
+    <p style="font-size:1.05rem;color:var(--text1);max-width:560px;margin:0 auto 36px;line-height:1.7">
+      Automatically route every prompt to the best free AI model — based on task complexity, latency, and provider health. One API, unlimited models.
+    </p>
+    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+      <button class="btn btn-primary" style="font-size:14px;padding:12px 28px" onclick="show('pg-login')">
+        Sign In to Dashboard
+      </button>
+      <a href="https://github.com/wwwbkgme-oss/omrp" target="_blank" class="btn btn-ghost" style="font-size:14px;padding:12px 28px;text-decoration:none">
+        View on GitHub →
+      </a>
+    </div>
+
+    <!-- API endpoint preview -->
+    <div style="margin-top:40px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r8);padding:16px 20px;text-align:left;max-width:600px;margin-left:auto;margin-right:auto">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:8px;font-family:var(--mono)">POST /v1/chat/completions</div>
+      <pre style="font-size:12px;color:var(--cyan);font-family:var(--mono);overflow-x:auto"><code>{
+  "model":    "omrp/auto",
+  "messages": [{"role":"user","content":"…"}]
+}</code></pre>
+      <div style="margin-top:8px;font-size:11px;color:var(--text2)">
+        ↑ Works with any OpenAI-compatible client — Cursor, Claude Desktop, Continue, Open WebUI, …
+      </div>
+    </div>
+  </section>
+
+  <!-- Live stats strip -->
+  <div id="land-stats" style="background:var(--bg2);border-top:1px solid var(--border);border-bottom:1px solid var(--border);padding:20px 32px;display:flex;justify-content:center;gap:40px;flex-wrap:wrap"></div>
+
+  <!-- Features -->
+  <section style="padding:64px 32px;max-width:960px;margin:0 auto">
+    <h2 style="text-align:center;font-size:1.6rem;font-weight:700;color:var(--text0);margin-bottom:8px">Everything you need to run a shared LLM gateway</h2>
+    <p style="text-align:center;color:var(--text2);margin-bottom:48px;font-size:0.95rem">Multi-user, multi-provider, fully self-hosted.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px">
+      ${[
+        ['⚡','Smart Routing','Bayesian classifier assigns every prompt a tier (simple→complex→reasoning) and picks the fastest available model automatically.','cyan'],
+        ['🔑','Per-User API Keys','Each user gets their own omrp-sk- key with configurable permissions: rate limits, model allow-lists, proxy bypass.','blue'],
+        ['⊛','Proxy Rate-Limit Bypass','Built-in proxy pool rotates IPs on 429 errors so users with bypass permission never hit free-tier rate limits.','purple'],
+        ['◈','Multi-Provider','OpenRouter, Groq, Cerebras, Kilo, BUW, or any custom OpenAI-compatible endpoint — add a key and it appears in the model list.','green'],
+        ['∷','Audit & Analytics','Every request is logged. Admins see global stats; users see their own usage. Full audit trail for all admin actions.','orange'],
+        ['◉','Bayesian Learning','The routing engine tracks per-model latency, error rates and success scores, improving routing decisions over time.','cyan'],
+      ].map(([icon,title,desc,cl])=>`
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r8);padding:20px;transition:var(--transition)" onmouseover="this.style.borderColor='var(--${cl})40'" onmouseout="this.style.borderColor='var(--border)'">
+          <div style="font-size:24px;margin-bottom:12px;filter:drop-shadow(0 0 6px var(--${cl})40)">${icon}</div>
+          <div style="font-size:14px;font-weight:700;color:var(--text0);margin-bottom:6px">${title}</div>
+          <div style="font-size:12px;color:var(--text2);line-height:1.6">${desc}</div>
+        </div>`).join('')}
+    </div>
+  </section>
+
+  <!-- How it works -->
+  <section style="padding:48px 32px;background:var(--bg2);border-top:1px solid var(--border);border-bottom:1px solid var(--border)">
+    <div style="max-width:840px;margin:0 auto">
+      <h2 style="text-align:center;font-size:1.4rem;font-weight:700;color:var(--text0);margin-bottom:36px">How OMRP routes your request</h2>
+      <div style="display:flex;flex-wrap:wrap;gap:0;justify-content:center;align-items:center">
+        ${[
+          ['1','Your client sends','POST /v1/chat/completions with any model name'],
+          ['→',''],
+          ['2','Classifier runs','Prompt complexity → tier assignment'],
+          ['→',''],
+          ['3','Router picks model','Fastest available model for that tier'],
+          ['→',''],
+          ['4','Response returned','With x-omrp-model and x-omrp-tier headers'],
+        ].map(([n,h,d])=>n==='→'
+          ? `<div style="font-size:20px;color:var(--text3);padding:0 8px">→</div>`
+          : `<div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--r8);padding:14px 16px;width:160px;text-align:center">
+              <div style="width:24px;height:24px;border-radius:50%;background:var(--cyan-dim);border:1px solid var(--cyan)30;color:var(--cyan);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;margin:0 auto 8px">${n}</div>
+              <div style="font-size:12px;font-weight:600;color:var(--text0);margin-bottom:4px">${h}</div>
+              <div style="font-size:10px;color:var(--text2)">${d}</div>
+            </div>`).join('')}
+      </div>
+    </div>
+  </section>
+
+  <!-- News / Announcements -->
+  <section style="padding:56px 32px;max-width:760px;margin:0 auto">
+    <h2 style="font-size:1.3rem;font-weight:700;color:var(--text0);margin-bottom:24px">📣 Announcements</h2>
+    <div id="land-news">
+      <div style="color:var(--text3);font-size:13px">Loading…</div>
+    </div>
+  </section>
+
+  <!-- Registration CTA -->
+  <section id="land-register-section" style="display:none;padding:48px 32px;background:linear-gradient(135deg,var(--bg2),var(--bg3));border-top:1px solid var(--border);text-align:center">
+    <div style="max-width:480px;margin:0 auto">
+      <div style="font-size:28px;margin-bottom:12px">🚀</div>
+      <h2 style="font-size:1.4rem;font-weight:700;color:var(--text0);margin-bottom:8px">Registration is open</h2>
+      <p style="color:var(--text2);font-size:0.9rem;margin-bottom:24px">Create a free account and start routing your AI requests immediately.</p>
+      <button class="btn btn-primary" style="font-size:14px;padding:12px 32px" onclick="show('pg-login');showRegister()">
+        Create Free Account
+      </button>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="padding:24px 32px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+    <div style="font-size:12px;color:var(--text3)">OMRP — Open Model Routing Protocol · Self-hosted LLM gateway</div>
+    <div style="display:flex;gap:16px">
+      <a href="https://github.com/wwwbkgme-oss/omrp" target="_blank" style="font-size:12px;color:var(--text3);text-decoration:none;hover:color:var(--text1)">GitHub</a>
+      <button class="btn btn-ghost" style="font-size:12px;padding:4px 10px" onclick="show('pg-login')">Sign In</button>
+    </div>
+  </footer>
+</div>
+
 <!-- App -->
 <div id="pg-app" style="display:none">
   <aside id="sidebar">
@@ -2001,7 +2128,8 @@ async function doLogout() {
   S.token = null; S.user = null;
   localStorage.removeItem('omrp_token');
   localStorage.removeItem('omrp_user');
-  show('pg-login');
+  show('pg-landing');
+  populateLanding();
 }
 
 // ── User self-service key reset ─────────────────────────────────────
@@ -2069,10 +2197,15 @@ function startApp() {
 // ═══════════════════════════════════════════════════════════════════
 
 function show(id) {
-  ['pg-loading','pg-login','pg-setup','pg-app'].forEach(p => {
+  ['pg-loading','pg-login','pg-setup','pg-landing','pg-app'].forEach(p => {
     const el = document.getElementById(p);
-    if (el) el.style.display = p === id ? (id==='pg-app'?'flex':'flex') : 'none';
+    if (el) el.style.display = p === id ? 'flex' : 'none';
   });
+  // Landing page uses block, not flex
+  if (id === 'pg-landing') {
+    const el = document.getElementById('pg-landing');
+    if (el) el.style.display = 'block';
+  }
 }
 
 async function boot() {
@@ -2108,14 +2241,65 @@ async function boot() {
     localStorage.removeItem('omrp_user');
   }
 
-  // 3. Load app name for login screen
+  // 3. Load app name for landing/login screen
   try {
     const r = await fetch('/api/admin/settings').then(r=>r.json()).catch(()=>({}));
     const n = (r.data||[]).find(s=>s.key==='app.name');
-    if (n) { S.appName = n.value; document.getElementById('app-name').textContent = n.value; }
+    if (n) {
+      S.appName = n.value;
+      const an = document.getElementById('app-name');   if (an) an.textContent = n.value;
+      const la = document.getElementById('land-appname'); if (la) la.textContent = n.value;
+    }
   } catch(_) {}
 
-  show('pg-login');
+  // 4. Show landing page (not login directly) and populate it
+  show('pg-landing');
+  populateLanding();
+}
+
+// ── Landing page data loader ──────────────────────────────────────────────────
+async function populateLanding() {
+  // Live stats
+  try {
+    const h = await fetch('/health').then(r=>r.json()).catch(()=>({}));
+    const s = await fetch('/stats').then(r=>r.json()).catch(()=>({}));
+    const strip = document.getElementById('land-stats');
+    if (strip) strip.innerHTML = [
+      ['⊛', h.proxy_pool||0, 'Proxy Pool'],
+      ['◎', s.user_count||0, 'Users'],
+      ['◉', h.db==='ok'?'Online':'Degraded', 'Status'],
+      ['⚡', 'omrp/auto', 'Smart Routing'],
+    ].map(([ic,v,l])=>`<div style="text-align:center">
+      <div style="font-size:22px;margin-bottom:4px">${ic}</div>
+      <div style="font-size:1.1rem;font-weight:700;color:var(--text0)">${v}</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:2px">${l}</div>
+    </div>`).join('');
+  } catch(_) {}
+
+  // News
+  try {
+    const { data: news=[] } = await fetch('/api/public/news').then(r=>r.json()).catch(()=>({data:[]}));
+    const el = document.getElementById('land-news');
+    if (!el) return;
+    el.innerHTML = news.length
+      ? news.map(n=>`<div style="margin-bottom:16px;padding:16px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r8);${n.is_pinned?'border-color:var(--cyan)30':''}">
+          ${n.is_pinned?'<span style="font-size:10px;padding:2px 7px;border-radius:10px;background:var(--cyan-dim);color:var(--cyan);font-weight:600;margin-right:8px">📌 PINNED</span>':''}
+          <span style="font-size:14px;font-weight:700;color:var(--text0)">${esc(n.title)}</span>
+          <div style="font-size:11px;color:var(--text3);margin-top:2px">${fmtDate(n.created_at)}</div>
+          ${n.body?`<div style="font-size:13px;color:var(--text1);margin-top:8px;line-height:1.6">${esc(n.body)}</div>`:''}
+        </div>`).join('')
+      : '<div style="color:var(--text3);font-size:13px;text-align:center;padding:24px">No announcements yet.</div>';
+  } catch(_) {}
+
+  // Registration CTA section
+  const regSec = document.getElementById('land-register-section');
+  const regBtn = document.getElementById('land-register-btn');
+  try {
+    const st = await fetch('/api/setup/status').then(r=>r.json()).catch(()=>({}));
+    const open = !!st.registration_open;
+    if (regSec) regSec.style.display = open ? 'block' : 'none';
+    if (regBtn) regBtn.style.display = open ? 'inline-flex' : 'none';
+  } catch(_) {}
 }
 
 // Keyboard support
