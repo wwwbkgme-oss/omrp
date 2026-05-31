@@ -70,21 +70,38 @@ fn mc(id: &str, provider: &str, tasks: &[&str], ctx: u32, tier: &str) -> ModelCo
 }
 
 // ─── Paths ────────────────────────────────────────────────────────────────────
+//
+// All persistent data lives next to the omrp binary so the installation
+// is fully self-contained:
+//
+//   <exe_dir>/
+//     config.toml        ← runtime configuration
+//     db/
+//       omrp.db          ← SQLite database
+//       ledger.jsonl     ← Bayesian routing ledger
 
-/// Returns `~/.config/omrp/config.toml` (XDG on Linux/macOS, AppData on Windows).
-pub fn default_config_path() -> PathBuf {
-    dirs::config_dir()
+/// Directory that contains the omrp binary.
+/// Falls back to CWD during `cargo test` / when current_exe() fails.
+pub fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("omrp")
-        .join("config.toml")
 }
 
-/// Returns `~/.local/share/omrp/ledger.jsonl`.
+/// `<exe_dir>/config.toml`
+pub fn default_config_path() -> PathBuf {
+    exe_dir().join("config.toml")
+}
+
+/// `<exe_dir>/db/omrp.db`
+pub fn default_db_path() -> PathBuf {
+    exe_dir().join("db").join("omrp.db")
+}
+
+/// `<exe_dir>/db/ledger.jsonl`
 pub fn default_ledger_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("omrp")
-        .join("ledger.jsonl")
+    exe_dir().join("db").join("ledger.jsonl")
 }
 
 // ─── Load / generate ─────────────────────────────────────────────────────────

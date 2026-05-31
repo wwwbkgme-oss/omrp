@@ -474,7 +474,9 @@ fn main() {
         }
         "serve" => {
             let mut port: u16 = 18800;
-            let mut host = "127.0.0.1".to_string();
+            // Default to all interfaces so the server works in Docker / VMs
+            // out of the box. Use --host 127.0.0.1 to restrict to localhost.
+            let mut host = "0.0.0.0".to_string();
             let mut i = 2usize;
             while i < args.len() {
                 match args[i].as_str() {
@@ -498,6 +500,7 @@ fn main() {
                 .block_on(web_server::run(cfg, &host, port));
         }
         "init" => cmd_init(),
+        "reset" => cmd_reset(),
         other => {
             eprintln!("Unknown command: {other:?}");
             print_usage();
@@ -510,18 +513,39 @@ fn print_usage() {
     eprintln!("OMRP — Open Model Routing Protocol");
     eprintln!();
     eprintln!("Usage:");
+    eprintln!("  omrp serve [--port N] [--host H]    Start web server (default 0.0.0.0:18800)");
+    eprintln!("  omrp reset                          Wipe database — next start shows setup wizard");
+    eprintln!("  omrp init                           Write default config.toml beside the binary");
     eprintln!("  omrp route [--task T] [--tier T] [--caveman lite|full|ultra] [--rtk] [--max-tokens N] <prompt>");
-    eprintln!("  omrp serve [--port N] [--host H] [--rtk] [--caveman lite|full|ultra]");
     eprintln!("  omrp models    List registered models");
     eprintln!("  omrp status    Health and routing scores");
     eprintln!("  omrp best <t>  Best model for a task (no API call)");
     eprintln!("  omrp dashboard Live TUI (q to quit)");
-    eprintln!("  omrp init      Create default config");
     eprintln!();
     eprintln!("Task types: code, reasoning, chat, vision, analysis");
     eprintln!("Tier types: simple, medium, complex, reasoning");
     eprintln!();
-    eprintln!("API keys (set for the providers you use):");
+    eprintln!("API keys (set env vars for each provider you use):");
     eprintln!("  CEREBRAS_API_KEY      GROQ_API_KEY");
     eprintln!("  KILO_API_KEY          OPENROUTER_API_KEY");
+}
+
+/// Wipe the database so the next `omrp serve` starts fresh with the setup wizard.
+fn cmd_reset() {
+    use crate::config::default_db_path;
+    let db_path = default_db_path();
+    if db_path.exists() {
+        match std::fs::remove_file(&db_path) {
+            Ok(_)  => {
+                eprintln!("[omrp reset] Database wiped: {}", db_path.display());
+                eprintln!("[omrp reset] Run 'omrp serve' — the setup wizard will appear on first visit.");
+            }
+            Err(e) => {
+                eprintln!("[omrp reset] Failed to remove {}: {e}", db_path.display());
+                std::process::exit(1);
+            }
+        }
+    } else {
+        eprintln!("[omrp reset] No database found at {} — nothing to reset.", db_path.display());
+    }
 }

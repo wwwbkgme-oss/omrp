@@ -987,12 +987,10 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
-/// Default database path: `~/.local/share/omrp/omrp.db`.
+/// Default database path: `<exe_dir>/db/omrp.db`.
+/// Delegates to `crate::config::default_db_path()` — single source of truth.
 pub fn default_db_path() -> std::path::PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("omrp")
-        .join("omrp.db")
+    crate::config::default_db_path()
 }
 
 // ─── CRUD: Proxy Request Tracking ────────────────────────────────────────────
