@@ -118,11 +118,12 @@ impl Config {
     /// Built-in model list — used when no config file exists.
     ///
     /// All models are permanently free-tier (no credits required).
-    /// Covers four providers; set the corresponding env var for each:
+    /// Covers five providers; set the corresponding env var for each:
     ///   Kilo      → KILO_API_KEY       (kilo/auto-free smart router)
     ///   Cerebras  → CEREBRAS_API_KEY   (wafer-fast, 14k req/day)
     ///   Groq      → GROQ_API_KEY       (ultra-low latency, 1k-14k req/day)
     ///   OpenRouter→ OPENROUTER_API_KEY (50-1000 req/day, many models)
+    ///   BUW       → BUW_API_KEY        (virtual model gateway)
     pub fn builtin_defaults() -> Self {
         Self {
             daemon: DaemonConfig { ledger_path: None },
@@ -157,6 +158,13 @@ impl Config {
                 mc("openai/gpt-oss-20b:free",                    "openrouter", &["chat","code","reasoning"],     128_000, "simple"),
                 mc("google/gemma-4-31b-it:free",                 "openrouter", &["chat","analysis","reasoning"], 262_144, "medium"),
                 mc("moonshotai/kimi-k2.6:free",                  "openrouter", &["reasoning","code","chat"],     262_144, "reasoning"),
+
+                // ── BUW Gateway (BUW_API_KEY) ────────────────────────────────────
+                // Virtual model endpoints on the BUW gateway.
+                // buw/omrp-auto: OMRP-compatible auto-routing virtual model.
+                // buw/auto-kilo: Kilo-aware auto-routing virtual model.
+                mc("buw/omrp-auto", "buw", &["code","reasoning","chat","analysis"], 1_048_576, "medium"),
+                mc("buw/auto-kilo", "buw", &["code","reasoning","chat"],            1_048_576, "reasoning"),
             ],
         }
     }
@@ -249,6 +257,7 @@ static DEFAULT_CONFIG_TOML: &str = r#"# OMRP configuration — all models are pe
 #   export GROQ_API_KEY=...         # https://console.groq.com   (ultra-low latency)
 #   export KILO_API_KEY=...         # https://kilo.ai            (smart auto-router)
 #   export OPENROUTER_API_KEY=...   # https://openrouter.ai/keys (50-1000 req/day)
+#   export BUW_API_KEY=...          # https://api.buw.xyz        (virtual model gateway)
 #
 #   omrp route "write a fibonacci function in Rust"
 #   omrp serve                      # OpenAI-compat proxy on :18800
@@ -389,6 +398,25 @@ provider = "openrouter"
 tasks = ["reasoning", "code", "chat"]
 ctx   = 262144
 tier  = "reasoning"
+
+# ─── BUW Gateway (BUW_API_KEY) ──────────────────────────────────────────────────
+# Virtual model endpoints on the BUW gateway (https://api.buw.xyz).
+# buw/omrp-auto: OMRP-compatible auto-routing virtual model.
+# buw/auto-kilo: Kilo-aware auto-routing virtual model.
+
+[[model]]
+id    = "buw/omrp-auto"
+provider = "buw"
+tasks = ["code", "reasoning", "chat", "analysis"]
+ctx   = 1048576
+tier  = "medium"
+
+[[model]]
+id    = "buw/auto-kilo"
+provider = "buw"
+tasks = ["code", "reasoning", "chat"]
+ctx   = 1048576
+tier  = "reasoning"
 "#;
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -400,28 +428,36 @@ mod tests {
     #[test]
     fn test_builtin_defaults_parses_models() {
         let cfg = Config::builtin_defaults();
-        // 2 Cerebras + 4 Groq + 3 Kilo + 8 OpenRouter = 17 total
-        assert_eq!(cfg.model.len(), 17, "got {}", cfg.model.len());
+        // 2 Cerebras + 4 Groq + 3 Kilo + 8 OpenRouter + 2 BUW = 19 total
+        assert_eq!(cfg.model.len(), 19, "got {}", cfg.model.len());
         let events = cfg.to_model_events();
-        assert_eq!(events.len(), 17);
-        // All models must be free-tier: either :free suffix OR kilo/auto* OR Cerebras/Groq (always free)
+        assert_eq!(events.len(), 19);
+        // All models must be free-tier: either :free suffix OR kilo/auto* OR Cerebras/Groq/BUW (always free)
         for m in &cfg.model {
             let is_free = m.id.ends_with(":free")
                 || m.id.starts_with("kilo/auto")
+                || m.id.starts_with("buw/")
                 || m.provider == "cerebras"
-                || m.provider == "groq";
+                || m.provider == "groq"
+                || m.provider == "buw";
             assert!(is_free, "model {} is not free-tier", m.id);
         }
-        // All four providers must be present
+        // All five providers must be present
         assert!(cfg.model.iter().any(|m| m.provider == "cerebras"));
         assert!(cfg.model.iter().any(|m| m.provider == "groq"));
         assert!(cfg.model.iter().any(|m| m.provider == "kilo"));
         assert!(cfg.model.iter().any(|m| m.provider == "openrouter"));
+        assert!(cfg.model.iter().any(|m| m.provider == "buw"));
         // Kilo slug fixed (Kilo-Org/kilocode#6686)
         assert!(cfg.model.iter().any(|m| m.id == "kilo/auto-free"),
             "kilo/auto-free must be present (not kilo-auto/free)");
         assert!(!cfg.model.iter().any(|m| m.id == "kilo-auto/free"),
             "stale kilo-auto/free slug must not be present");
+        // BUW virtual models must be present
+        assert!(cfg.model.iter().any(|m| m.id == "buw/omrp-auto"),
+            "buw/omrp-auto must be present");
+        assert!(cfg.model.iter().any(|m| m.id == "buw/auto-kilo"),
+            "buw/auto-kilo must be present");
         // All models must have tier assigned
         assert!(cfg.model.iter().all(|m| !m.tier.is_empty()));
     }
