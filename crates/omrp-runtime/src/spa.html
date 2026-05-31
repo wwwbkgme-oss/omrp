@@ -565,6 +565,7 @@ const ADMIN_PAGES = [
   { id:'logs',       icon:'∷', label:'Audit Logs'        },
   { id:'proxies',    icon:'⊛', label:'Proxies'           },
   { id:'models',     icon:'◉', label:'Models'            },
+  { id:'news',       icon:'📣', label:'Announcements'    },
 ];
 const USER_PAGES = [
   { id:'playground', icon:'⚡', label:'Playground'      },
@@ -628,6 +629,7 @@ async function render(page) {
       case 'logs':       await renderLogs(ca); break;
       case 'proxies':    await renderProxies(ca); break;
       case 'models':     await renderModels(ca); break;
+      case 'news':       await renderAdminNews(ca); break;
       case 'my-keys':    await renderMyKeys(ca); break;
       case 'my-pkeys':   await renderMyProviders(ca); break;
       case 'my-stats':   await renderMyStats(ca); break;
@@ -1417,18 +1419,33 @@ async function revokeKey(path, page) {
 
 async function renderProviderKeys(ca) {
   const {data:keys=[]} = await GET('/api/admin/provider-keys');
-  const PROVIDERS = ['openrouter','kilo','cerebras','groq','buw'];
+  const KNOWN = ['openrouter','kilo','cerebras','groq','buw'];
+
+  // Collect all distinct providers (known + any custom ones added by admin)
+  const allProviders = [...new Set([...KNOWN, ...keys.map(k=>k.provider)])];
+
   ca.innerHTML = `
     <div class="section-header">
-      <div><div class="section-title">Provider API Keys</div><div class="section-sub">Credentials for LLM backends (global keys apply to all users)</div></div>
+      <div><div class="section-title">Provider API Keys</div>
+        <div class="section-sub">Credentials for LLM backends — global keys apply to all users</div>
+      </div>
       <button class="btn btn-primary" onclick="showCreatePKey(true)">+ Add Key</button>
     </div>
-    ${PROVIDERS.map(p => {
-      const pk = keys.filter(k=>k.provider===p);
+    ${allProviders.map(p => {
+      const pk  = keys.filter(k=>k.provider===p);
+      const isCustom = !KNOWN.includes(p);
+      const sampleKey = pk[0];
+      const title = sampleKey?.display_name || (isCustom ? p : p.toUpperCase());
+      const subtitle = sampleKey?.base_url
+        ? `<span style="font-family:var(--mono);font-size:10px;color:var(--text3)">${esc(sampleKey.base_url)}</span>`
+        : `<span class="badge badge-gray">${p.toUpperCase()}_API_KEY</span>`;
       return `<div class="card" style="margin-bottom:12px">
         <div class="card-header">
-          <div style="display:flex;align-items:center;gap:8px">${provIcon(p)}<span class="card-title">${p.toUpperCase()}</span>
-            <span class="badge badge-gray">${p === 'openrouter' ? 'OPENROUTER_API_KEY' : p === 'kilo' ? 'KILO_API_KEY' : p === 'cerebras' ? 'CEREBRAS_API_KEY' : p === 'groq' ? 'GROQ_API_KEY' : 'BUW_API_KEY'}</span>
+          <div style="display:flex;align-items:center;gap:8px">
+            ${provIcon(p)}
+            <span class="card-title">${esc(title)}</span>
+            ${subtitle}
+            ${isCustom?'<span class="badge badge-blue">custom</span>':''}
           </div>
         </div>
         ${pk.length ? `<div class="card-body" style="padding:0"><div class="tbl-wrap">
@@ -1441,23 +1458,40 @@ async function renderProviderKeys(ca) {
           <td>${k.is_active?`<button class="btn btn-danger" style="padding:4px 8px;font-size:11px" onclick="revokeKey('/api/admin/provider-keys/${k.id}','pkeys')">Revoke</button>`:''}
           </td>
         </tr>`).join('')}</tbody></table>
-        </div></div>` : `<div class="card-body" style="padding:12px 18px;color:var(--text2);font-size:12px">No key configured — will use <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">${p.toUpperCase()}_API_KEY</code> env var.</div>`}
+        </div></div>` : `<div class="card-body" style="padding:12px 18px;color:var(--text2);font-size:12px">
+          No key configured${isCustom?'':` — will use <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">${p.toUpperCase()}_API_KEY</code> env var if set`}.
+        </div>`}
       </div>`;
     }).join('')}`;
 }
 
 function showCreatePKey(isAdmin) {
-  const PROVIDERS = ['openrouter','kilo','cerebras','groq','buw'];
+  const PROVIDERS = ['openrouter','kilo','cerebras','groq','buw','custom'];
   const endpoint = isAdmin ? '/api/admin/provider-keys' : '/api/user/provider-keys';
   const doneNav  = isAdmin ? 'pkeys' : 'my-pkeys';
   openModal(`
     <div class="modal-title">Add Provider Key</div>
-    <div class="modal-sub">The key value is stored and used for API calls.</div>
+    <div class="modal-sub">The key value is stored encrypted and used for API calls.</div>
     <div class="form-group"><label class="form-label">Provider</label>
-      <select id="m-prov" class="form-select">${PROVIDERS.map(p=>`<option value="${p}">${p}</option>`).join('')}</select>
+      <select id="m-prov" class="form-select" onchange="pkeyProvChange()">
+        ${PROVIDERS.map(p=>`<option value="${p}">${p==='custom'?'⊕ Custom / self-hosted':p}</option>`).join('')}
+      </select>
     </div>
-    <div class="form-group"><label class="form-label">API Key</label><input id="m-kval" class="form-input" placeholder="sk-…" autocomplete="off"></div>
-    <div class="form-group"><label class="form-label">Label (optional)</label><input id="m-label" class="form-input" placeholder="Primary key"></div>
+    <!-- Custom provider extra fields (hidden by default) -->
+    <div id="m-custom-fields" style="display:none">
+      <div class="form-group">
+        <label class="form-label">Base URL <span style="color:var(--text2)">(e.g. http://localhost:1234/v1)</span></label>
+        <input id="m-base-url" class="form-input" placeholder="https://api.example.com/v1" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Display name <span style="color:var(--text2)">(optional)</span></label>
+        <input id="m-dname" class="form-input" placeholder="My LM Studio">
+      </div>
+    </div>
+    <div class="form-group"><label class="form-label">API Key</label>
+      <input id="m-kval" class="form-input" placeholder="sk-… (leave blank if no auth required)" autocomplete="off"></div>
+    <div class="form-group"><label class="form-label">Label <span style="color:var(--text2)">(optional)</span></label>
+      <input id="m-label" class="form-input" placeholder="Primary key"></div>
     ${isAdmin?`<div class="form-group"><label class="form-label">Scope</label>
       <select id="m-global" class="form-select"><option value="1">Global (all users)</option><option value="0">Personal</option></select>
     </div>`:''}
@@ -1467,13 +1501,26 @@ function showCreatePKey(isAdmin) {
     </div>`);
 }
 
+function pkeyProvChange() {
+  const prov = document.getElementById('m-prov')?.value;
+  const cf   = document.getElementById('m-custom-fields');
+  if (cf) cf.style.display = prov === 'custom' ? 'block' : 'none';
+}
+
 async function createPKey(endpoint, page, isAdmin) {
+  const prov = document.getElementById('m-prov').value;
+  const isCustom = prov === 'custom';
   const body = {
-    provider:  document.getElementById('m-prov').value,
-    key_value: document.getElementById('m-kval').value.trim(),
+    provider:  isCustom ? (document.getElementById('m-dname').value.trim().toLowerCase().replace(/\s+/g,'-') || 'custom') : prov,
+    key_value: document.getElementById('m-kval').value.trim() || '(none)',  // some local servers need no key
     label:     document.getElementById('m-label').value.trim()||undefined,
+    base_url:  isCustom ? (document.getElementById('m-base-url').value.trim()||undefined) : undefined,
+    display_name: isCustom ? (document.getElementById('m-dname').value.trim()||undefined) : undefined,
   };
   if (isAdmin) body.is_global = document.getElementById('m-global').value === '1';
+  if (isCustom && !document.getElementById('m-base-url').value.trim()) {
+    toast('Base URL required for custom providers','err'); return;
+  }
   if (!body.key_value) { toast('Key value required','err'); return; }
   const r = await POST(endpoint, body);
   if (r.error) { toast(r.error.message,'err'); return; }
@@ -1910,6 +1957,114 @@ async function renderModels(ca) {
 // ═══════════════════════════════════════════════════════════════════
 //  USER PAGES
 // ═══════════════════════════════════════════════════════════════════
+
+// ─── Admin: Announcements ─────────────────────────────────────────────────────
+
+async function renderAdminNews(ca) {
+  const {data:items=[]} = await GET('/api/admin/news');
+  ca.innerHTML = `
+    <div class="section-header">
+      <div>
+        <div class="section-title">Announcements</div>
+        <div class="section-sub">Publish news to the landing page — pinned items appear first</div>
+      </div>
+      <button class="btn btn-primary" onclick="newsCreate()">+ New</button>
+    </div>
+    ${items.length ? `<div class="card">
+      <div class="card-body" style="padding:0"><div class="tbl-wrap"><table>
+        <thead><tr>
+          <th style="width:40px">Pin</th><th>Title</th><th style="width:90px">Status</th>
+          <th style="width:110px">Created</th><th style="width:110px">Updated</th>
+          <th style="width:110px">Actions</th>
+        </tr></thead>
+        <tbody>${items.map(n=>`<tr>
+          <td style="text-align:center">${n.is_pinned?'📌':'—'}</td>
+          <td>
+            <div style="font-weight:600;font-size:13px">${esc(n.title)}</div>
+            ${n.body?`<div style="font-size:11px;color:var(--text2);max-width:420px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(n.body)}</div>`:''}
+          </td>
+          <td>${n.is_published
+            ?'<span class="badge badge-green">published</span>'
+            :'<span class="badge badge-gray">draft</span>'}</td>
+          <td style="font-size:11px;color:var(--text2)">${fmtDatetime(n.created_at)}</td>
+          <td style="font-size:11px;color:var(--text2)">${fmtDatetime(n.updated_at)}</td>
+          <td style="white-space:nowrap">
+            <button class="btn btn-ghost" style="font-size:11px;padding:3px 8px" onclick="newsEdit(${n.id},'${esc(n.title).replace(/'/g,"\\'")}','${esc(n.body||'').replace(/'/g,"\\'")}',${n.is_pinned},${n.is_published})">Edit</button>
+            <button class="btn btn-danger" style="font-size:11px;padding:3px 8px" onclick="newsDelete(${n.id})">Del</button>
+          </td>
+        </tr>`).join('')}</tbody>
+      </table></div></div>
+    </div>`
+    : `<div class="card"><div class="card-body" style="text-align:center;padding:32px;color:var(--text2)">
+      No announcements yet. Click <strong>+ New</strong> to publish one to the landing page.
+    </div></div>`}`;
+}
+
+function newsCreate() {
+  openModal(`
+    <div class="modal-title">New Announcement</div>
+    <div class="form-group"><label class="form-label">Title</label>
+      <input id="ni-title" class="form-input" placeholder="What's new?"></div>
+    <div class="form-group"><label class="form-label">Body <span style="color:var(--text2)">(optional)</span></label>
+      <textarea id="ni-body" class="form-input" rows="4" placeholder="Additional details…" style="resize:vertical"></textarea></div>
+    <div style="display:flex;gap:16px;margin-top:4px">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+        <input type="checkbox" id="ni-pin"> Pin to top</label>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="newsSave()">Publish</button>
+    </div>`);
+}
+
+function newsEdit(id, title, body, pinned, published) {
+  openModal(`
+    <div class="modal-title">Edit Announcement</div>
+    <div class="form-group"><label class="form-label">Title</label>
+      <input id="ni-title" class="form-input" value="${esc(title)}"></div>
+    <div class="form-group"><label class="form-label">Body</label>
+      <textarea id="ni-body" class="form-input" rows="4" style="resize:vertical">${esc(body)}</textarea></div>
+    <div style="display:flex;gap:16px;margin-top:4px">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+        <input type="checkbox" id="ni-pin" ${pinned?'checked':''}> Pin to top</label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+        <input type="checkbox" id="ni-pub" ${published?'checked':''}> Published</label>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="newsSaveEdit(${id})">Save</button>
+    </div>`);
+}
+
+async function newsSave() {
+  const title = document.getElementById('ni-title').value.trim();
+  if (!title) { toast('Title required','err'); return; }
+  const r = await POST('/api/admin/news', {
+    title, body: document.getElementById('ni-body').value.trim()||undefined,
+    is_pinned: document.getElementById('ni-pin').checked,
+  });
+  if (r.error) { toast(r.error.message,'err'); return; }
+  closeModal(); toast('Published'); nav('news');
+}
+
+async function newsSaveEdit(id) {
+  const title = document.getElementById('ni-title').value.trim();
+  if (!title) { toast('Title required','err'); return; }
+  const r = await PUT(`/api/admin/news/${id}`, {
+    title, body: document.getElementById('ni-body').value.trim(),
+    is_pinned: document.getElementById('ni-pin').checked,
+    is_published: document.getElementById('ni-pub').checked,
+  });
+  if (r.error) { toast(r.error.message,'err'); return; }
+  closeModal(); toast('Saved'); nav('news');
+}
+
+async function newsDelete(id) {
+  if (!confirm('Delete this announcement?')) return;
+  const r = await DEL(`/api/admin/news/${id}`);
+  if (r.error) { toast(r.error.message,'err'); return; }
+  toast('Deleted'); nav('news');
+}
 
 async function renderMyKeys(ca) {
   // Each user has exactly 1 API key — load it via the new endpoint
