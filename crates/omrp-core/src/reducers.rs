@@ -21,9 +21,25 @@ fn windowed_avg(current: f64, new_value: f64, window_size: u64) -> f64 {
     current * (1.0 - 1.0 / window_size as f64) + new_value * (1.0 / window_size as f64)
 }
 
-/// Garbage detection: model has very low success ratio and its last event was a failure.
+/// Wilson Score garbage detection.
+///
+/// A model is garbage when its Wilson Score lower bound (95% CI) falls below
+/// `GARBAGE_THRESHOLD` AND we have enough observations to make a confident
+/// assertion (at least `MIN_OBS`).
+///
+/// The Wilson Score lower bound is more principled than a plain ratio check:
+/// it accounts for statistical uncertainty so a model with 1 success and 3
+/// failures is treated differently from one with 100 successes and 300 failures.
+const GARBAGE_THRESHOLD: f64 = 0.15;
+const MIN_OBS:           u64 = 5;
+
 fn is_garbage(health: &HealthStatus) -> bool {
-    health.success_ratio < 0.2 && health.last_failure > health.last_success
+    // Require a minimum number of observations before labelling as garbage.
+    if health.total_obs() < MIN_OBS {
+        return false;
+    }
+    // Wilson Score lower bound < threshold AND last event was a failure.
+    health.wilson_lower() < GARBAGE_THRESHOLD && health.last_failure > health.last_success
 }
 
 /// ─── ALL reducers in one dispatch table ───
@@ -73,8 +89,10 @@ pub fn dispatch(state: &mut State, event: &Event) {
                     health.last_success = now;
                     health.rolling_latency_avg_ms =
                         windowed_avg(health.rolling_latency_avg_ms, *latency_ms as f64, 20);
+                    health.success_count = health.success_count.saturating_add(1);
                 } else {
                     health.last_failure = now;
+                    health.failure_count = health.failure_count.saturating_add(1);
                 }
                 health.success_ratio = update_success_ratio(health.success_ratio, *success);
                 health.garbage = is_garbage(health);
@@ -92,6 +110,7 @@ pub fn dispatch(state: &mut State, event: &Event) {
             let now = state.current_time();
             if let Some(health) = state.health.get_mut(model_id) {
                 health.last_failure = now;
+                health.failure_count = health.failure_count.saturating_add(1);
                 health.success_ratio = update_success_ratio(health.success_ratio, false);
                 health.garbage = is_garbage(health);
             }
@@ -104,6 +123,8 @@ pub fn dispatch(state: &mut State, event: &Event) {
                 health.last_success = now;
                 health.rolling_latency_avg_ms =
                     windowed_avg(health.rolling_latency_avg_ms, *latency_ms as f64, 10);
+                health.success_count = health.success_count.saturating_add(1);
+                health.garbage = is_garbage(health);
             }
         }
 
@@ -111,6 +132,7 @@ pub fn dispatch(state: &mut State, event: &Event) {
             let now = state.current_time();
             if let Some(health) = state.health.get_mut(model_id) {
                 health.last_failure = now;
+                health.failure_count = health.failure_count.saturating_add(1);
                 health.garbage = is_garbage(health);
             }
         }
@@ -135,8 +157,10 @@ pub fn dispatch(state: &mut State, event: &Event) {
                     health.last_success = now;
                     health.rolling_latency_avg_ms =
                         windowed_avg(health.rolling_latency_avg_ms, *latency_ms as f64, 20);
+                    health.success_count = health.success_count.saturating_add(1);
                 } else {
                     health.last_failure = now;
+                    health.failure_count = health.failure_count.saturating_add(1);
                 }
                 health.success_ratio = update_success_ratio(health.success_ratio, *success);
                 health.garbage = is_garbage(health);
