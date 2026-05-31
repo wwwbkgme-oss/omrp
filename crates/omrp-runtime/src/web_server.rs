@@ -140,8 +140,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // ── Admin: stats / logs / proxies ─────────────────────────────────────
         .route("/api/admin/stats",              get(admin_stats))
         .route("/api/admin/audit-logs",         get(admin_audit_logs))
-        .route("/api/admin/proxies",            get(admin_list_proxies))
-        .route("/api/admin/proxies/refresh",    post(admin_refresh_proxies))
+        .route("/api/admin/proxies",              get(admin_list_proxies).post(admin_add_proxy))
+        .route("/api/admin/proxies/:id",          delete(admin_delete_proxy))
+        .route("/api/admin/proxies/:id/activate", post(admin_activate_proxy))
+        .route("/api/admin/proxies/refresh",      post(admin_refresh_proxies))
         // ── Admin: model health + routing intelligence ─────────────────────────
         .route("/api/admin/models/health",  get(admin_model_health))
         .route("/api/admin/routing/stats",  get(admin_routing_stats))
@@ -805,11 +807,15 @@ async fn admin_list_provider_keys(
 
 #[derive(Deserialize)]
 struct CreateProviderKeyRequest {
-    provider:  String,
-    key_value: String,
-    label:     Option<String>,
-    is_global: Option<bool>,
-    user_id:   Option<String>,
+    provider:     String,
+    key_value:    String,
+    label:        Option<String>,
+    is_global:    Option<bool>,
+    user_id:      Option<String>,
+    /// Custom base URL for non-standard / self-hosted providers.
+    /// If omitted the built-in URL for `provider` is used.
+    base_url:     Option<String>,
+    display_name: Option<String>,
 }
 
 async fn admin_create_provider_key(
@@ -825,14 +831,16 @@ async fn admin_create_provider_key(
     }
     let ts = now_secs() as i64;
     let row = ProviderKeyRow {
-        id:         Uuid::new_v4().to_string(),
-        user_id:    req.user_id,
-        provider:   req.provider.clone(),
-        key_value:  req.key_value,
-        label:      req.label.unwrap_or_default(),
-        is_active:  true,
-        is_global:  req.is_global.unwrap_or(false),
-        created_at: ts,
+        id:           Uuid::new_v4().to_string(),
+        user_id:      req.user_id,
+        provider:     req.provider.clone(),
+        key_value:    req.key_value,
+        label:        req.label.unwrap_or_default(),
+        is_active:    true,
+        is_global:    req.is_global.unwrap_or(false),
+        created_at:   ts,
+        base_url:     req.base_url,
+        display_name: req.display_name,
     };
     if let Err(e) = state.db.insert_provider_key(&row) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e);
@@ -927,9 +935,51 @@ async fn admin_list_proxies(
     State(state): State<Arc<AppState>>, user: AuthUser,
 ) -> Response {
     if let Some(e) = require_admin(&user) { return e; }
-    match state.db.active_proxies() {
-        Ok(proxies) => ok(json!({ "data": proxies.iter().map(|(id, url)| json!({ "id": id, "url": url })).collect::<Vec<_>>() })),
+    match state.db.full_proxies() {
+        Ok(proxies) => ok(json!({ "data": proxies })),
         Err(e)      => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddProxyRequest { url: String }
+
+async fn admin_add_proxy(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Json(req): Json<AddProxyRequest>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    let url = req.url.trim().to_string();
+    if url.is_empty() { return err(StatusCode::BAD_REQUEST, "url required"); }
+    let protocol = url.split("://").next().unwrap_or("http").to_string();
+    let ts = now_secs() as i64;
+    match state.db.upsert_proxy(&url, &protocol, None, None, ts) {
+        Ok(_)  => ok(json!({ "status": "ok", "url": url })),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn admin_delete_proxy(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    match state.db.delete_proxy(id) {
+        Ok(true)  => { state.proxy_pool.load(&state.db); ok(json!({"status":"ok"})) }
+        Ok(false) => err(StatusCode::NOT_FOUND, "proxy not found"),
+        Err(e)    => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn admin_activate_proxy(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    match state.db.activate_proxy(id) {
+        Ok(true)  => { state.proxy_pool.load(&state.db); ok(json!({"status":"ok"})) }
+        Ok(false) => err(StatusCode::NOT_FOUND, "proxy not found"),
+        Err(e)    => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 
@@ -1407,14 +1457,16 @@ async fn user_create_provider_key(
     }
     let ts = now_secs() as i64;
     let row = ProviderKeyRow {
-        id:         Uuid::new_v4().to_string(),
-        user_id:    Some(user.user_id.clone()),
-        provider:   req.provider,
-        key_value:  req.key_value,
-        label:      req.label.unwrap_or_default(),
-        is_active:  true,
-        is_global:  false,   // users can't create global keys
-        created_at: ts,
+        id:           Uuid::new_v4().to_string(),
+        user_id:      Some(user.user_id.clone()),
+        provider:     req.provider,
+        key_value:    req.key_value,
+        label:        req.label.unwrap_or_default(),
+        is_active:    true,
+        is_global:    false,   // users can't create global keys
+        created_at:   ts,
+        base_url:     req.base_url,
+        display_name: req.display_name,
     };
     if let Err(e) = state.db.insert_provider_key(&row) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e);
@@ -1618,14 +1670,15 @@ async fn proxy_completions(
             use crate::provider::ProviderKind;
             let uid_ref = maybe_user.0.as_ref().map(|u| u.user_id.as_str());
             let fallback = ProviderKind::all().iter().find_map(|prov| {
-                let key = state.db
+                let has_key = state.db
                     .resolve_provider_key(prov.to_str(), uid_ref)
                     .unwrap_or(None)
-                    .or_else(|| std::env::var(prov.api_key_env()).ok());
-                key.map(|_| {
+                    .is_some()
+                    || std::env::var(prov.api_key_env()).is_ok();
+                if has_key {
                     let model = prov.free_models().first().map(|(m,_)| *m).unwrap_or("auto");
-                    (model.to_string(), prov.to_str().to_string())
-                })
+                    Some((model.to_string(), prov.to_str().to_string()))
+                } else { None }
             });
             match fallback {
                 Some((model, _prov)) => (model, tier.as_str().to_string()),
@@ -1658,9 +1711,14 @@ async fn proxy_completions(
 
     // ── Resolve provider API key (DB first, then env) ─────────────────────────
     let user_id = maybe_user.0.as_ref().map(|u| u.user_id.as_str()).unwrap_or("").to_string();
-    let db_key  = state.db
+    let db_resolved = state.db
         .resolve_provider_key(&prov_name, if user_id.is_empty() { None } else { Some(&user_id) })
         .unwrap_or(None);
+    // db_key_value = the API key string; custom_base_url = optional custom endpoint
+    let (db_key_value, custom_base_url) = match db_resolved {
+        Some((k, u)) => (Some(k), u),
+        None         => (None, None),
+    };
 
     let routed       = routed_model.clone();
     let prov         = prov_name.clone();
@@ -1673,13 +1731,15 @@ async fn proxy_completions(
     let the_key_id   = caller_key_id.clone();
 
     // Resolve the API key string once, before entering spawn_blocking.
-    // This lets us rebuild CompatClient for every proxy retry without
+    // Resolve the API key string + optional custom base URL once, before entering
+    // spawn_blocking — lets us rebuild CompatClient for every proxy retry without
     // re-querying the DB or re-reading env vars.
-    let api_key_str: String = db_key.unwrap_or_else(|| {
+    let api_key_str: String = db_key_value.unwrap_or_else(|| {
         crate::provider::ProviderKind::from_str(&prov)
             .and_then(|k| std::env::var(k.api_key_env()).ok())
             .unwrap_or_default()
     });
+    let custom_url = custom_base_url; // rename for clarity in closures
 
     // ── STREAMING PATH (SSE) ─────────────────────────────────────────────────
     // When client sends "stream":true, pipe SSE bytes directly from provider.
@@ -1690,6 +1750,7 @@ async fn proxy_completions(
         let api3 = api_key_str.clone(); let prov3 = prov.clone();
         let routed3 = routed.clone(); let _tier3 = tier_out.clone();
         let uid3 = uid_opt.clone(); let the_key3 = the_key_id.clone();
+        let cust3 = custom_url.clone();
         let ubody = json!({
             "model": routed, "messages": msgs,
             "max_tokens": max_tokens.unwrap_or(2048), "stream": true,
@@ -1704,6 +1765,8 @@ async fn proxy_completions(
             for attempt in (if pa {1} else {0})..tot {
                 let c = if api3.is_empty() {
                     match CompatClient::for_provider(&prov3) { Ok(x)=>x, Err(_)=>break }
+                } else if let Some(ref url) = cust3 {
+                    CompatClient::from_key_custom(&api3, url)
                 } else {
                     match CompatClient::from_key_and_provider(&prov3, &api3) { Ok(x)=>x, Err(_)=>break }
                 };
@@ -1760,6 +1823,7 @@ async fn proxy_completions(
     // On auth / model-not-found: break immediately (rotating IPs won't help).
 
     const MAX_PROXY_ATTEMPTS: usize = 12;
+    let cust_url = custom_url.clone();
 
     let result: Result<Result<crate::provider::CompletionResult, String>, _> =
         task::spawn_blocking(move || -> Result<crate::provider::CompletionResult, String> {
@@ -1794,6 +1858,8 @@ async fn proxy_completions(
                     Ok(c)  => c,
                     Err(e) => return Err(e),
                 }
+            } else if let Some(ref url) = cust_url {
+                CompatClient::from_key_custom(&api_key_str, url)
             } else {
                 match CompatClient::from_key_and_provider(&prov, &api_key_str) {
                     Ok(c)  => c,

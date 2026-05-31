@@ -250,6 +250,24 @@ impl CompatClient {
         Ok(Self { base_url: kind.base_url().into(), api_key: api_key.to_string(), kind, proxy_url: None })
     }
 
+    /// Build a client with a fully custom base URL (for self-hosted / custom providers).
+    /// `provider` is used only for display; it may be an arbitrary string.
+    pub fn from_key_custom(api_key: &str, base_url: &str) -> Self {
+        Self {
+            base_url:  base_url.trim_end_matches('/').to_string(),
+            api_key:   api_key.to_string(),
+            kind:      ProviderKind::OpenRouter, // structural placeholder; base_url overrides
+            proxy_url: None,
+        }
+    }
+
+    /// Override the base URL after construction — useful when a DB key has a custom endpoint.
+    #[allow(dead_code)]
+    pub fn with_base_url(mut self, url: &str) -> Self {
+        self.base_url = url.trim_end_matches('/').to_string();
+        self
+    }
+
     /// Provider name for display.
     #[allow(dead_code)]
     pub fn provider_name(&self) -> &str {

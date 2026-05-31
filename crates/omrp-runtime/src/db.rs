@@ -109,9 +109,25 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SCHEMA_SQL)?;
         // Additive column migrations (safe to run multiple times — errors silently ignored)
-        let _ = conn.execute("ALTER TABLE api_keys ADD COLUMN permissions TEXT NOT NULL DEFAULT '{}'", []);
-        let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN proxy_id INTEGER", []);
-        let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN proxy_url TEXT", []);
+        let _ = conn.execute("ALTER TABLE api_keys      ADD COLUMN permissions   TEXT NOT NULL DEFAULT '{}'", []);
+        let _ = conn.execute("ALTER TABLE request_logs  ADD COLUMN proxy_id      INTEGER", []);
+        let _ = conn.execute("ALTER TABLE request_logs  ADD COLUMN proxy_url     TEXT", []);
+        // Custom provider support: store a per-key base URL and friendly display name
+        let _ = conn.execute("ALTER TABLE provider_keys ADD COLUMN base_url      TEXT", []);
+        let _ = conn.execute("ALTER TABLE provider_keys ADD COLUMN display_name  TEXT", []);
+        // Announcements for the landing page
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS announcements (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                title       TEXT    NOT NULL,
+                body        TEXT    NOT NULL DEFAULT '',
+                is_pinned   INTEGER NOT NULL DEFAULT 0,
+                is_published INTEGER NOT NULL DEFAULT 1,
+                author_id   TEXT,
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL
+            );",
+        );
         Ok(())
     }
 
@@ -349,14 +365,32 @@ pub struct ApiKeyRow {
 
 #[derive(Debug, Clone)]
 pub struct ProviderKeyRow {
-    pub id:         String,
-    pub user_id:    Option<String>,
-    pub provider:   String,
-    pub key_value:  String,
-    pub label:      String,
-    pub is_active:  bool,
-    pub is_global:  bool,
-    pub created_at: i64,
+    pub id:           String,
+    pub user_id:      Option<String>,
+    pub provider:     String,
+    pub key_value:    String,
+    pub label:        String,
+    pub is_active:    bool,
+    pub is_global:    bool,
+    pub created_at:   i64,
+    /// Optional custom base URL — overrides the built-in provider URL.
+    /// Used for custom / self-hosted OpenAI-compatible endpoints.
+    pub base_url:     Option<String>,
+    /// Human-readable provider name shown in the UI (e.g. "My LM Studio").
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct AnnouncementRow {
+    pub id:           i64,
+    pub title:        String,
+    pub body:         String,
+    pub is_pinned:    bool,
+    pub is_published: bool,
+    pub author_id:    Option<String>,
+    pub created_at:   i64,
+    pub updated_at:   i64,
 }
 
 #[derive(Debug, Clone)]
@@ -405,14 +439,17 @@ fn map_api_key(r: &rusqlite::Row<'_>) -> SqlResult<ApiKeyRow> {
 
 fn map_provider_key(r: &rusqlite::Row<'_>) -> SqlResult<ProviderKeyRow> {
     Ok(ProviderKeyRow {
-        id:         r.get(0)?,
-        user_id:    r.get(1)?,
-        provider:   r.get(2)?,
-        key_value:  r.get(3)?,
-        label:      r.get(4)?,
-        is_active:  r.get::<_, i64>(5)? != 0,
-        is_global:  r.get::<_, i64>(6)? != 0,
-        created_at: r.get(7)?,
+        id:           r.get(0)?,
+        user_id:      r.get(1)?,
+        provider:     r.get(2)?,
+        key_value:    r.get(3)?,
+        label:        r.get(4)?,
+        is_active:    r.get::<_, i64>(5)? != 0,
+        is_global:    r.get::<_, i64>(6)? != 0,
+        created_at:   r.get(7)?,
+        // base_url and display_name are additive columns — may be NULL on old rows
+        base_url:     r.get(8).ok().flatten(),
+        display_name: r.get(9).ok().flatten(),
     })
 }
 
@@ -700,11 +737,12 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO provider_keys
-             (id,user_id,provider,key_value,label,is_active,is_global,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+             (id,user_id,provider,key_value,label,is_active,is_global,created_at,base_url,display_name)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 row.id, row.user_id, row.provider, row.key_value, row.label,
                 row.is_active as i64, row.is_global as i64, row.created_at,
+                row.base_url, row.display_name,
             ],
         )?;
         Ok(())
@@ -713,7 +751,7 @@ impl Database {
     pub fn list_provider_keys_for_user(&self, user_id: &str) -> SqlResult<Vec<ProviderKeyRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,user_id,provider,key_value,label,is_active,is_global,created_at
+            "SELECT id,user_id,provider,key_value,label,is_active,is_global,created_at,base_url,display_name
              FROM provider_keys WHERE user_id=?1 OR is_global=1
              ORDER BY created_at DESC",
         )?;
@@ -726,7 +764,7 @@ impl Database {
     pub fn list_all_provider_keys(&self) -> SqlResult<Vec<ProviderKeyRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,user_id,provider,key_value,label,is_active,is_global,created_at
+            "SELECT id,user_id,provider,key_value,label,is_active,is_global,created_at,base_url,display_name
              FROM provider_keys ORDER BY created_at DESC",
         )?;
         let result: Vec<ProviderKeyRow> = stmt
@@ -743,23 +781,87 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// Return the active key value for a provider (global first, then user-owned).
+    /// Return the active key value + optional custom base_url for a provider.
+    /// Returns `(key_value, base_url)` — base_url is None for built-in providers.
     pub fn resolve_provider_key(
         &self, provider: &str, user_id: Option<&str>,
-    ) -> SqlResult<Option<String>> {
+    ) -> SqlResult<Option<(String, Option<String>)>> {
         let conn = self.conn.lock().unwrap();
         let uid = user_id.unwrap_or("");
         let mut stmt = conn.prepare(
-            "SELECT key_value FROM provider_keys
+            "SELECT key_value, base_url FROM provider_keys
              WHERE provider=?1 AND is_active=1
                AND (is_global=1 OR (?2 != '' AND user_id=?2))
              ORDER BY is_global DESC, created_at ASC
              LIMIT 1",
         )?;
-        let mut result: Vec<String> = stmt
-            .query_map(params![provider, uid], |r| r.get(0))?
+        let mut result: Vec<(String, Option<String>)> = stmt
+            .query_map(params![provider, uid], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<SqlResult<Vec<_>>>()?;
         Ok(result.pop())
+    }
+}
+
+// ─── CRUD: Announcements ─────────────────────────────────────────────────────
+
+impl Database {
+    #[allow(dead_code)]
+    pub fn list_announcements(&self, published_only: bool) -> SqlResult<Vec<AnnouncementRow>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if published_only {
+            "SELECT id,title,body,is_pinned,is_published,author_id,created_at,updated_at
+             FROM announcements WHERE is_published=1 ORDER BY is_pinned DESC, created_at DESC"
+        } else {
+            "SELECT id,title,body,is_pinned,is_published,author_id,created_at,updated_at
+             FROM announcements ORDER BY is_pinned DESC, created_at DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let result = stmt.query_map([], |r| Ok(AnnouncementRow {
+            id:           r.get(0)?,
+            title:        r.get(1)?,
+            body:         r.get(2)?,
+            is_pinned:    r.get::<_,i64>(3)? != 0,
+            is_published: r.get::<_,i64>(4)? != 0,
+            author_id:    r.get(5)?,
+            created_at:   r.get(6)?,
+            updated_at:   r.get(7)?,
+        }))?.collect::<SqlResult<Vec<_>>>()?;
+        Ok(result)
+    }
+
+    #[allow(dead_code)]
+    pub fn create_announcement(
+        &self, title: &str, body: &str, author_id: Option<&str>, pinned: bool,
+    ) -> SqlResult<i64> {
+        let ts = now_secs();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO announcements (title,body,is_pinned,is_published,author_id,created_at,updated_at)
+             VALUES (?1,?2,?3,1,?4,?5,?5)",
+            params![title, body, pinned as i64, author_id, ts],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    #[allow(dead_code)]
+    pub fn update_announcement(
+        &self, id: i64, title: &str, body: &str, pinned: bool, published: bool,
+    ) -> SqlResult<bool> {
+        let ts = now_secs();
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE announcements SET title=?1, body=?2, is_pinned=?3, is_published=?4, updated_at=?5
+             WHERE id=?6",
+            params![title, body, pinned as i64, published as i64, ts, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_announcement(&self, id: i64) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM announcements WHERE id=?1", params![id])?;
+        Ok(n > 0)
     }
 }
 
@@ -946,6 +1048,53 @@ impl Database {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<SqlResult<Vec<_>>>()?;
         Ok(result)
+    }
+
+    /// Full proxy table — all columns, all rows (active + inactive).
+    /// Used by the admin Excel-style proxy grid.
+    pub fn full_proxies(&self) -> SqlResult<Vec<serde_json::Value>> {
+        use serde_json::json;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,url,protocol,country,anonymity,is_active,
+                    last_check,latency_ms,uptime_pct,fail_count,added_at
+             FROM proxies ORDER BY is_active DESC, latency_ms ASC NULLS LAST",
+        )?;
+        let result: Vec<serde_json::Value> = stmt.query_map([], |r| {
+            let latency: Option<i64>  = r.get(7)?;
+            let uptime:  f64          = r.get(8)?;
+            let active:  i64          = r.get(5)?;
+            Ok(json!({
+                "id":         r.get::<_,i64>(0)?,
+                "url":        r.get::<_,String>(1)?,
+                "protocol":   r.get::<_,String>(2)?,
+                "country":    r.get::<_,Option<String>>(3)?,
+                "anonymity":  r.get::<_,Option<String>>(4)?,
+                "is_active":  active == 1,
+                "last_check": r.get::<_,Option<i64>>(6)?,
+                "latency_ms": latency,
+                "uptime_pct": (uptime * 10.0).round() / 10.0,
+                "fail_count": r.get::<_,i64>(9)?,
+                "added_at":   r.get::<_,i64>(10)?,
+            }))
+        })?.collect::<SqlResult<Vec<_>>>()?;
+        Ok(result)
+    }
+
+    /// Permanently delete a proxy row.
+    pub fn delete_proxy(&self, id: i64) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM proxies WHERE id=?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    /// Re-activate a previously deactivated proxy.
+    pub fn activate_proxy(&self, id: i64) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE proxies SET is_active=1, fail_count=0 WHERE id=?1", params![id]
+        )?;
+        Ok(n > 0)
     }
 
     pub fn proxy_count(&self) -> SqlResult<i64> {
@@ -1242,9 +1391,10 @@ mod tests {
             id: "pk1".into(), user_id: None, provider: "openrouter".into(),
             key_value: "sk-or-test".into(), label: "Global".into(),
             is_active: true, is_global: true, created_at: ts,
+            base_url: None, display_name: None,
         }).unwrap();
         let v = db.resolve_provider_key("openrouter", None).unwrap();
-        assert_eq!(v.as_deref(), Some("sk-or-test"));
+        assert_eq!(v.map(|(k,_)| k).as_deref(), Some("sk-or-test"));
     }
 
     #[test]
