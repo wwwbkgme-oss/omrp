@@ -10,6 +10,7 @@
 //!   omrp dashboard    Live TUI dashboard
 //!   omrp init         Write default config
 
+mod auth;
 mod config;
 mod dashboard;
 mod db;
