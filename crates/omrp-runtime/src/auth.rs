@@ -65,11 +65,16 @@ pub struct AuthUser {
 pub struct AppState {
     pub db:         Database,
     pub jwt_secret: String,
+    pub cfg:        std::sync::Arc<crate::config::Config>,
 }
 
 impl AppState {
     pub fn new(db: Database, jwt_secret: impl Into<String>) -> Self {
-        Self { db, jwt_secret: jwt_secret.into() }
+        Self {
+            db,
+            jwt_secret: jwt_secret.into(),
+            cfg: std::sync::Arc::new(crate::config::Config::builtin_defaults()),
+        }
     }
 }
 
