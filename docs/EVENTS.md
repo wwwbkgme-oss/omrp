@@ -370,28 +370,36 @@ pub struct ModelCapabilities {
 
 ---
 
-## `HealthStatus` Fields
+## `HealthStatus` Fields (v0.2)
 
 `HealthStatus` is what the reducer maintains per model and what the
 scorer reads. It is never set directly — only `dispatch` writes to it.
 
 ```rust
 pub struct HealthStatus {
-    pub last_success: SequencedInstant, // epoch = never succeeded
-    pub last_failure: SequencedInstant, // epoch = never failed
-    pub success_ratio: f32,             // EMA, init = 0.5
-    pub rolling_latency_avg_ms: f64,    // EMA, init = 0.0
-    pub garbage: bool,                  // excluded from routing when true
+    pub last_success:           SequencedInstant, // EPOCH = never succeeded
+    pub last_failure:           SequencedInstant, // EPOCH = never failed
+    pub success_ratio:          f32,              // EMA α=0.1, init 0.5 (backward compat)
+    pub rolling_latency_avg_ms: f64,              // EMA, init 0.0
+    pub garbage:                bool,             // excluded from routing when true
+
+    // v0.2: Bayesian Beta distribution parameters
+    pub success_count:          u64,              // α — incremented on success events
+    pub failure_count:          u64,              // β — incremented on failure events
 }
 ```
 
-`success_ratio` is updated on `CompletionFinished`, `ModelFailed`, and
-`ReportReceived` using an exponential moving average with `α = 0.1`:
+**Bayesian helpers available on `HealthStatus`:**
+- `alpha()` — `success_count + 1` (Laplace-smoothed α)
+- `beta_param()` — `failure_count + 1` (Laplace-smoothed β)
+- `bayesian_competence()` — `α/(α+β)` posterior mean
+- `wilson_lower()` — Wilson Score 95% lower bound (used for garbage detection)
+- `beta_variance()` — `αβ/((α+β)²(α+β+1))` variance of the Beta distribution
+- `stability_score()` — `1 − sqrt(variance)/0.5` normalised to `[0,1]`
 
-```
-new_ratio = old_ratio × 0.9 + outcome × 0.1
-```
+**`success_count` and `failure_count`** are updated on:
+`CompletionFinished` (success or failure), `ModelFailed`, `ProbeUpdated` (success),
+`ProbeFailed` (failure), `ReportReceived`.
 
-where `outcome = 1.0` for success, `0.0` for failure. Starting from `0.5`,
-a model reaches the garbage threshold (`< 0.2`) after approximately
-11 consecutive failures with no intervening successes.
+**Garbage detection** uses the Wilson Score lower bound (see `docs/ROUTING.md`
+for full details). The flag is re-evaluated on every state-mutating event.

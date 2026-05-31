@@ -1,4 +1,4 @@
-# OMRP Architecture
+# OMRP Architecture — v0.2
 
 ## Crate Dependency Graph
 
@@ -20,82 +20,112 @@ for the entire system.
 
 ---
 
+## System Overview
+
+OMRP v0.2 combines a **deterministic LLM routing kernel** with a
+**multi-user web application**.  The web layer adds SQLite persistence,
+JWT authentication, an admin/user dashboard, and a proxy pool — but the
+routing kernel underneath remains pure and deterministic.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  omrp-runtime                                                            │
+│                                                                          │
+│  omrp serve  ──► axum web server (web_server.rs)                        │
+│               │     REST API, SPA (spa.html), LLM proxy passthrough      │
+│               │                                                           │
+│               ├──► auth.rs    JWT / Argon2id / onboarding               │
+│               ├──► db.rs      SQLite via rusqlite (11 tables)            │
+│               └──► proxy.rs   ProxyScrape fetch + pool                   │
+│                                                                           │
+│  omrp route  ──► routing.rs (bootstrap_pipeline, select_for_tier)       │
+│  omrp status │                                                           │
+│  omrp best   └──► uses omrp-core directly (deterministic)               │
+│  omrp dashboard                                                          │
+└────────────────────────────┬────────────────────────────────────────────┘
+                             │ uses
+┌────────────────────────────▼────────────────────────────────────────────┐
+│  omrp-core                                                               │
+│                                                                          │
+│  EventPipeline ──► LedgerStore (SHA-256 chain)                          │
+│       │                                                                  │
+│       ▼                                                                  │
+│  dispatch(&mut State, &Event)  ← pure reducer                            │
+│       │                                                                  │
+│       ▼                                                                  │
+│  State { models, health { α,β,Wilson,EMA }, inflight, cache, diag }     │
+│       │                                                                  │
+│       ▼                                                                  │
+│  RouterEngine::select()           ← deterministic BKG-FMR 5-factor     │
+│  RouterEngine::select_thompson()  ← Thompson Sampling (probabilistic)  │
+└──────────────────────────────────────────────────────────────────────────┘
+        depends on
+┌─────────────────────────────────────────────────────────────────────────┐
+│  omrp-events │  omrp-types                                              │
+│  Event enum  │  Model, TaskType, RouteRequest, RoutingDecision          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Data Flow
 
 ```
-External input
+External input (HTTP or CLI)
       │
       ▼
  EventPipeline::process(event)
       │
       ├─ 1. validate(&event)          ← omrp-events::validate
-      │         │
-      │         └─ Err → PipelineError::Validation (caller handles)
       │
-      ├─ 2. ledger.append(event)      ← LedgerStore (in-memory, Phase 1)
-      │         │
-      │         └─ computes SHA-256 checksum, chains to previous entry
+      ├─ 2. ledger.append(event)      ← SHA-256 chained to previous
       │
-      └─ 3. dispatch(&mut state, &event) ← pure reducer, no IO
+      └─ 3. dispatch(&mut state, &event)  ← pure reducer, no IO
                 │
-                └─ mutates State in place
+                └─ mutates State:
+                   • success_count / failure_count (Bayesian α/β)
+                   • success_ratio (EMA, backward compat)
+                   • rolling_latency_avg_ms (EMA)
+                   • garbage (Wilson Score lower bound)
 
       State
         │
-        └─ RouterEngine::select(&state, &request)
-                │
-                └─ RoutingDecision { selected_model, score, factors,
-                                     fallback_chain, timestamp }
+        ├─ RouterEngine::select()          → deterministic RoutingDecision
+        └─ RouterEngine::select_thompson() → Thompson Sample RoutingDecision
 ```
 
-No step may read wall-clock time, generate randomness, or perform IO.
-The reducer (`dispatch`) and the router (`select`) are pure functions.
+No reducer step may read wall-clock time, generate randomness, or perform IO.
 
 ---
 
 ## Three-Machine Model
 
-OMRP separates concerns into three logical machines.
-In Phase 1 all three run in the same process; in later phases they may
-be separated.
-
 ```
-┌─────────────────────────────────────────────────────────┐
-│  1. Ledger Machine                                       │
-│                                                          │
-│  Source of truth. Append-only. Never mutated.            │
-│  Each entry is SHA-256 chained to the previous one.      │
-│  Tampering anywhere in the chain is immediately          │
-│  detectable by verify_chain().                           │
-│                                                          │
-│  LedgerStore { entries: Vec<LedgerEntry>, ... }         │
-│  LedgerEntry { seq, logical_time, event, checksum }      │
-└────────────────────────┬────────────────────────────────┘
-                         │ ordered slice of Events
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│  2. Reducer Machine                                      │
-│                                                          │
-│  Derives State from the event stream.                    │
-│  Pure: no IO, no randomness, no SystemTime.              │
-│  Determinism guarantee: same events → identical State.   │
-│                                                          │
-│  fn dispatch(state: &mut State, event: &Event)           │
-│  State { models, health, inflight,                       │
-│          routing_cache, diagnostics }                    │
-└────────────────────────┬────────────────────────────────┘
-                         │ immutable State snapshot
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│  3. Scheduler Machine                                    │
-│                                                          │
-│  Selects the best model for a task request.              │
-│  Pure: no IO, no side effects, same inputs → same        │
-│  output always.                                          │
-│                                                          │
-│  fn select(&self, state: &State,                         │
-│            request: &RouteRequest) -> RoutingDecision    │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  1. Ledger Machine                                               │
+│                                                                  │
+│  Append-only, SHA-256 chained.  Tampering anywhere detectable.  │
+│  LedgerStore { entries: Vec<LedgerEntry>, path, checksum }      │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ ordered slice of Events
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  2. Reducer Machine                                              │
+│                                                                  │
+│  Pure: no IO, no randomness, no SystemTime.                      │
+│  Determinism guarantee: same events → identical State.           │
+│  fn dispatch(state: &mut State, event: &Event)                  │
+│  Updates: health (α/β/EMA), inflight, routing_cache, diag       │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ immutable State snapshot
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  3. Scheduler Machine                                            │
+│                                                                  │
+│  select():          deterministic BKG-FMR scoring               │
+│  select_thompson(): probabilistic Thompson Sampling              │
+│  Returns: RoutingDecision { model, score, factors, fallback }   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -104,42 +134,20 @@ be separated.
 
 ### `omrp-types`
 
-Shared vocabulary. No dependencies other than `serde` and `serde_json`.
+Shared vocabulary. No dependencies other than `serde`.
 
 | Module | Key types |
 |--------|-----------|
-| `time` | `SequencedInstant { seq: u64, logical_time: u64 }`, `Clock` |
+| `time` | `SequencedInstant { seq, logical_time }`, `Clock` |
 | `model` | `Model { id, provider, capabilities }`, `ModelCapabilities`, `ModelId = String` |
 | `task` | `TaskType` (Code/Reasoning/Chat/Vision/Analysis), `RouteRequest` |
 | `routing` | `RoutingDecision`, `ModelScore`, `ScoreFactor`, `RoutingCache`, `FallbackEntry` |
-
-**`SequencedInstant`** replaces wall-clock time everywhere inside reducers.
-It is deterministic (derived from the count of processed events), totally
-ordered (implements `Ord`), and replay-safe.
-
-```rust
-pub struct SequencedInstant {
-    pub seq: u64,          // monotonically increasing, never resets
-    pub logical_time: u64, // same as seq in Phase 1
-}
-
-impl State {
-    pub fn current_time(&self) -> SequencedInstant {
-        SequencedInstant {
-            seq: self.diagnostics.total_completions
-               + self.diagnostics.total_failures + 1,
-            logical_time: self.diagnostics.total_completions
-                        + self.diagnostics.total_failures,
-        }
-    }
-}
-```
 
 ---
 
 ### `omrp-events`
 
-Event definitions and validation. Depends on `omrp-types`.
+Event definitions and validation.
 
 | Module | Purpose |
 |--------|---------|
@@ -147,192 +155,110 @@ Event definitions and validation. Depends on `omrp-types`.
 | `error` | `ErrorKind`, `ProviderError` |
 | `validate` | `validate(&Event) -> Result<(), ValidationError>` |
 
-The `Event` enum is the only type that flows into the ledger and the
-reducer. Nothing else is persisted.
-
 ---
 
 ### `omrp-core`
 
-The engine. Depends on both `omrp-types` and `omrp-events`.
+The routing kernel. Pure, deterministic, no IO.
 
 | Module | Key type / function | Role |
 |--------|---------------------|------|
 | `state` | `State`, `HealthStatus`, `Diagnostics` | Projected in-memory state |
-| `reducers` | `dispatch(&mut State, &Event)` | Pure state transition |
+| `reducers` | `dispatch(&mut State, &Event)` | Pure state transition; updates α/β and Wilson Score garbage flag |
 | `pipeline` | `EventPipeline` | Orchestrates validate → persist → apply |
 | `ledger` | `LedgerStore`, `LedgerEntry` | Tamper-evident append-only log |
-| `scorer` | `Scorer`, `ScoringWeights` | BKG-FMR 5-factor scoring |
-| `router` | `RouterEngine` | Deterministic model selection |
+| `scorer` | `Scorer`, `ScoringWeights` | BKG-FMR 5-factor Bayesian scoring |
+| `router` | `RouterEngine` | Deterministic `select()` + probabilistic `select_thompson()` |
+| `caveman` | `CavemanLevel`, `inject_caveman` | Prompt compression (lite/full/ultra) |
+| `classifier` | `classify_prompt`, `detect_mode_override` | Tier classification |
+| `rtk` | `compress_messages`, `format_rtk_log` | Tool output compression |
 
-#### `state::State`
-
-```
-State
-├── models: Vec<Model>                  — registered models
-├── health: HashMap<ModelId, HealthStatus>
-│       ├── last_success: SequencedInstant
-│       ├── last_failure: SequencedInstant
-│       ├── success_ratio: f32          — EMA (α=0.1), init 0.5
-│       ├── rolling_latency_avg_ms: f64 — EMA (window 10–20)
-│       └── garbage: bool               — excluded from routing
-├── inflight: HashMap<ModelId, u32>     — current in-flight requests
-├── routing_cache: RoutingCache
-│       ├── last_selected: Option<RoutingCacheEntry>
-│       └── last_fallback: Option<FallbackEntry>
-└── diagnostics: Diagnostics
-        ├── total_completions: u64
-        ├── total_failures: u64
-        ├── total_fallbacks: u64
-        └── total_degradations: u64
-```
-
-`State` is fully serialisable (`serde::Serialize + Deserialize`) so that
-replay identity can be asserted with `serde_json::to_value`.
-
-#### `reducers::dispatch`
-
-Single-dispatch table for all events. Signature:
+#### `state::HealthStatus` (v0.2)
 
 ```rust
-pub fn dispatch(state: &mut State, event: &Event)
-```
+pub struct HealthStatus {
+    // Timestamps (deterministic SequencedInstant)
+    pub last_success:          SequencedInstant,
+    pub last_failure:          SequencedInstant,
 
-Returns `()` — errors are not surfaced; unknown-model events silently
-skip the mutation. This is intentional: the ledger is the source of
-truth; reducers never fail.
+    // Legacy EMA success ratio (backward compat, still updated)
+    pub success_ratio:         f32,             // EMA α=0.1, init 0.5
 
-**EMA update rule** (used for `success_ratio` and `rolling_latency_avg_ms`):
+    // Latency
+    pub rolling_latency_avg_ms: f64,            // EMA, init 0.0
 
-```
-success_ratio' = success_ratio × (1 − α) + outcome × α
-    where α = 0.1, outcome ∈ {0.0, 1.0}
+    // Garbage flag (set by Wilson Score)
+    pub garbage:               bool,
 
-rolling_latency' = latency × (1 − 1/W) + new_ms × (1/W)
-    where W = 10 for ProbeUpdated, 20 for CompletionFinished
-```
+    // NEW v0.2: Bayesian Beta distribution parameters
+    pub success_count:         u64,             // α (successes)
+    pub failure_count:         u64,             // β (failures)
+}
 
-**Garbage detection** (computed after every `CompletionFinished`,
-`ModelFailed`, `ReportReceived`):
-
-```rust
-fn is_garbage(health: &HealthStatus) -> bool {
-    health.success_ratio < 0.2
-        && health.last_failure > health.last_success
+// Derived methods:
+impl HealthStatus {
+    pub fn alpha()               -> f64  // success_count + 1  (Laplace smoothing)
+    pub fn beta_param()          -> f64  // failure_count + 1
+    pub fn bayesian_competence() -> f64  // α/(α+β) posterior mean
+    pub fn wilson_lower()        -> f64  // Wilson Score 95% CI lower bound
+    pub fn beta_variance()       -> f64  // αβ / ((α+β)²(α+β+1))
+    pub fn stability_score()     -> f64  // 1 - normalised std-dev of Beta
 }
 ```
 
-Starting from the neutral prior `success_ratio = 0.5`, a model reaches
-`< 0.2` after approximately 11 consecutive failures with no successes
-(or fewer if it had prior failures).
+#### `reducers::dispatch` (v0.2 changes)
 
-#### `pipeline::EventPipeline`
+- **`success_count` / `failure_count`** incremented on every
+  `CompletionFinished`, `ModelFailed`, `ProbeUpdated`, `ProbeFailed`
+- **Garbage detection** upgraded from simple EMA threshold to
+  Wilson Score lower bound — see `docs/ROUTING.md` for details
+- EMA `success_ratio` still maintained for backward-compatible ledger replay
 
-```rust
-pub struct EventPipeline {
-    state: ProjectionView<State>,  // Arc<RwLock<State>>
-    event_log: Vec<Event>,
-}
-```
-
-Processing order:
-1. `validate(&event)` — reject invalid events before they touch the ledger
-2. `event_log.push(event.clone())` — in-memory log (replaces LedgerStore in Phase 1)
-3. `dispatch(&mut state, &event)` — mutate projected state
-
-`verify_replay()` replays the entire log from scratch and asserts equality
-with the live state via `serde_json::to_value` comparison.
-
-> **Phase 2**: `event_log` will be replaced by `LedgerStore::append`.
-
-#### `ledger::LedgerStore`
+#### `router::RouterEngine` (v0.2 additions)
 
 ```rust
-pub struct LedgerStore {
-    path: PathBuf,
-    entries: Vec<LedgerEntry>,
-    last_checksum: [u8; 32],
-}
-```
-
-Each entry's checksum is computed as:
-
-```
-checksum = SHA-256(
-    previous_checksum   // [0u8; 32] for genesis
-  ‖ seq.to_le_bytes()
-  ‖ logical_time.to_le_bytes()
-  ‖ serde_json::to_vec(&event)
-)
-```
-
-The checksum is serialised as a 64-character lowercase hex string in
-JSON Lines files. `load()` calls `verify_chain()` before returning;
-any integrity violation returns `Err(ChainIntegrityViolation)`.
-
-#### `scorer::Scorer`
-
-```
-score(model, request) =
-    health_score    × 0.35
-  + latency_score   × 0.20
-  + success_rate    × 0.25
-  + stability_score × 0.10
-  + load_score      × 0.10
-  + capability_bonus          ← not weighted, flat bonus
-```
-
-| Sub-score | Formula |
-|-----------|---------|
-| `health_score` | `0.0` if garbage, `0.5` if no data, `1.0` if healthy |
-| `latency_score` | `max(0, 1 − (avg_ms − 500) / 9500)` — 500 ms = 1.0, 10 s = 0.0 |
-| `success_rate` | `0.5` if no data, else `health.success_ratio as f64` |
-| `stability_score` | `1.0` if `last_success > last_failure`, else `0.0` |
-| `load_score` | `max(0, 1 − inflight / max_inflight)` |
-| `capability_bonus` | `+0.15` task match, `+0.10` vision, `+0.10` tool use, `+0.05` ctx window |
-
-#### `router::RouterEngine`
-
-```rust
+// Deterministic (unchanged)
 pub fn select(&self, state: &State, request: &RouteRequest) -> RoutingDecision
+
+// NEW: Thompson Sampling (probabilistic)
+pub fn select_thompson(&self, state: &State, request: &RouteRequest) -> RoutingDecision
 ```
 
-1. Filter out garbage models
-2. Score every remaining model
-3. Sort descending by score; tiebreak ascending by `model_id` (lexicographic)
-4. Return the first model as `selected_model`; the full sorted list as `fallback_chain`
+`select_thompson` uses a Xorshift64 PRNG seeded from the ledger sequence,
+samples Beta(α, β) via the Gamma ratio method (Marsaglia-Tsang), and
+combines the sample with load and capability factors.
 
-The sort is fully deterministic: `f64::partial_cmp` with
-`Ordering::Equal` as the NaN fallback, then `str::cmp`.
+---
+
+### `omrp-runtime` modules (v0.2)
+
+| Module | Purpose |
+|--------|---------|
+| `main.rs` | CLI entry point: route, serve, models, status, best, dashboard, init |
+| `config.rs` | TOML config at `~/.config/omrp/config.toml`; 5-provider built-in defaults |
+| `provider.rs` | OpenAI-compatible HTTP clients for OpenRouter, Kilo, Cerebras, Groq, BUW |
+| `routing.rs` | Shared helpers: `bootstrap_pipeline`, `select_for_tier`, `tier_from_str` |
+| `server.rs` | Legacy tiny_http proxy (kept for `--rtk`/`--caveman` flags) |
+| `web_server.rs` | Axum web server: REST API + SPA + LLM proxy passthrough |
+| `auth.rs` | Argon2id passwords, HS256 JWT, axum `FromRequestParts` extractor |
+| `db.rs` | SQLite CRUD layer (11 tables) via rusqlite |
+| `keys.rs` | File-based API key store (used by legacy server.rs) |
+| `proxy.rs` | ProxyScrape fetch, JSON + text ingest, DB upsert |
+| `spa.html` | Cyberpunk enterprise SPA (admin + user dashboards, onboarding wizard) |
+| `dashboard.rs` | Ratatui TUI live dashboard |
 
 ---
 
 ## Core Invariants
 
-### No Wall-Clock Time in Reducers
-`SystemTime`, `Instant`, `chrono::Utc::now()` are forbidden inside
-`dispatch`. Time is tracked exclusively via `State::current_time()` which
-derives `SequencedInstant` from the deterministic `diagnostics` counters.
-
-### Single Mutation Path
-All state changes flow through `dispatch(&mut State, &Event)`.
-No module outside `reducers.rs` may mutate `State` fields directly.
-
-### Replay Safety
-```
-replay(events) == replay(events)   // always, for any event sequence
-```
-Verified by `EventPipeline::verify_replay()` and the integration tests
-in `crates/omrp-core/tests/determinism.rs`.
-
-### Ledger Append-Only
-`LedgerStore` has no `remove`, `update`, or `truncate` methods.
-The only mutating operation is `append`, which extends the chain.
-
-### Reducer Never Fails
-`dispatch` returns `()`. If an event references an unknown model, the
-reducer silently no-ops. This keeps the pipeline infallible after
-validation has already passed.
+| Invariant | Description |
+|-----------|-------------|
+| **No wall-clock time in reducers** | `SystemTime` / `Instant` forbidden inside `dispatch`; time tracked via `SequencedInstant` |
+| **Single mutation path** | All state changes flow through `dispatch(&mut State, &Event)` |
+| **Replay safety** | `replay(events) == replay(events)` for any event sequence |
+| **Ledger append-only** | `LedgerStore` has no remove/update/truncate methods |
+| **Reducer never fails** | `dispatch` returns `()`; unknown-model events no-op silently |
+| **Thompson randomness is external** | `select()` is pure; `select_thompson()` is explicitly probabilistic |
 
 ---
 
@@ -340,46 +266,58 @@ validation has already passed.
 
 ```
 omrp/
-├── Cargo.toml                     workspace root (virtual manifest)
+├── Cargo.toml                         workspace root (v0.2.0)
 ├── Cargo.lock
 ├── .gitignore
 ├── README.md
-├── TASKS.md                       Phase 2+ task list
+├── TASKS.md                           Phase roadmap
+│
+├── .github/workflows/ci.yml           GitHub Actions: build + test + clippy
 │
 ├── crates/
-│   ├── omrp-types/
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── model.rs           Model, ModelId, ModelCapabilities
-│   │       ├── task.rs            TaskType, RouteRequest
-│   │       ├── routing.rs         RoutingDecision, ScoreFactor, RoutingCache
-│   │       └── time.rs            SequencedInstant, Clock
+│   ├── omrp-types/src/
+│   │   ├── model.rs                   Model, ModelId, ModelCapabilities
+│   │   ├── task.rs                    TaskType, RouteRequest
+│   │   ├── routing.rs                 RoutingDecision, ScoreFactor, RoutingCache
+│   │   └── time.rs                    SequencedInstant, Clock
 │   │
-│   ├── omrp-events/
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── event.rs           Event (14 variants), ModelSource
-│   │       ├── error.rs           ErrorKind, ProviderError
-│   │       └── validate.rs        validate(), ValidationError
+│   ├── omrp-events/src/
+│   │   ├── event.rs                   Event (14 variants), ModelSource
+│   │   ├── error.rs                   ErrorKind, ProviderError
+│   │   └── validate.rs                validate(), ValidationError
 │   │
 │   ├── omrp-core/
-│   │   ├── tests/
-│   │   │   └── determinism.rs     integration: replay identity, fuzz
+│   │   ├── tests/determinism.rs       integration: replay identity, fuzz
 │   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── state.rs           State, HealthStatus, Diagnostics
-│   │       ├── reducers.rs        dispatch(), EMA helpers, garbage detection
-│   │       ├── pipeline.rs        EventPipeline, ProjectionView
-│   │       ├── ledger.rs          LedgerStore, LedgerEntry, hex_bytes serde
-│   │       ├── scorer.rs          Scorer, ScoringWeights
-│   │       └── router.rs          RouterEngine
+│   │       ├── state.rs               State, HealthStatus (+ α/β v0.2), Diagnostics
+│   │       ├── reducers.rs            dispatch(), EMA, Wilson Score garbage detection
+│   │       ├── pipeline.rs            EventPipeline, ProjectionView
+│   │       ├── ledger.rs              LedgerStore, LedgerEntry, SHA-256 chain
+│   │       ├── scorer.rs              Scorer, ScoringWeights, Bayesian factors
+│   │       ├── router.rs              RouterEngine: select() + select_thompson()
+│   │       ├── caveman.rs             Prompt compression
+│   │       ├── classifier.rs          Prompt tier classifier
+│   │       └── rtk/                   Tool output compression (RTK)
 │   │
-│   └── omrp-runtime/
-│       └── src/
-│           └── main.rs            CLI: models | status | best <task>
+│   └── omrp-runtime/src/
+│       ├── main.rs                    CLI dispatcher
+│       ├── config.rs                  TOML config, 5-provider defaults
+│       ├── provider.rs                HTTP clients (OpenRouter/Kilo/Cerebras/Groq/BUW)
+│       ├── routing.rs                 bootstrap_pipeline, select_for_tier helpers
+│       ├── server.rs                  Legacy tiny_http proxy
+│       ├── web_server.rs              Axum server (REST API + SPA)
+│       ├── auth.rs                    JWT + Argon2id auth middleware
+│       ├── db.rs                      SQLite 11-table CRUD layer
+│       ├── keys.rs                    File-based API key store
+│       ├── proxy.rs                   ProxyScrape proxy pool
+│       ├── spa.html                   Cyberpunk enterprise SPA
+│       └── dashboard.rs               TUI (ratatui)
 │
 └── docs/
-    ├── ARCHITECTURE.md            ← this file
-    ├── EVENTS.md                  event catalogue, state effects, validation
-    └── ROUTING.md                 scoring algorithm, garbage detection
+    ├── ARCHITECTURE.md                ← this file
+    ├── EVENTS.md                      event catalogue, state effects, validation
+    ├── ROUTING.md                     Bayesian scoring, Thompson Sampling, Wilson Score
+    ├── WEB.md                         web server, REST API reference, auth flow
+    ├── DATABASE.md                    SQLite schema, table descriptions, CRUD patterns
+    └── PROVIDERS.md                   provider setup (5 providers + BUW)
 ```
