@@ -97,6 +97,7 @@ impl Database {
     }
 
     /// Open an in-memory database (for tests).
+    #[allow(dead_code)]
     pub fn open_in_memory() -> SqlResult<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -128,6 +129,7 @@ impl Database {
     }
 
     /// Returns `true` if the schema has been applied.
+    #[allow(dead_code)]
     pub fn is_initialised(&self) -> bool {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -512,6 +514,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn user_roles(&self, user_id: &str) -> SqlResult<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -536,6 +539,7 @@ impl Database {
         Ok(result)
     }
 
+    #[allow(dead_code)]
     pub fn user_permissions(&self, user_id: &str) -> SqlResult<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1031,6 +1035,7 @@ impl Database {
     }
 
     /// Per-proxy detail: top models and users for a specific proxy URL.
+    #[allow(dead_code)]
     pub fn proxy_detail_stats(&self, proxy_url: &str)
         -> SqlResult<(Vec<(String, i64)>, Vec<(String, i64)>)>
     {

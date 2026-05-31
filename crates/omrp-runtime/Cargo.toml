@@ -38,4 +38,6 @@ uuid.workspace       = true
 rand.workspace       = true
 
 # misc
-chrono.workspace     = true
+chrono.workspace       = true
+tokio-stream.workspace = true
+bytes.workspace        = true

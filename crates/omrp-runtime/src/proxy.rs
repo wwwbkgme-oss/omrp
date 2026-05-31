@@ -42,6 +42,7 @@ pub struct ProxyEntry {
     /// Full proxy URL, e.g. `http://1.2.3.4:8080` or `socks5://1.2.3.4:1080`.
     pub url:        String,
     /// Protocol (`http`, `https`, `socks5`).
+    #[allow(dead_code)]
     pub protocol:   String,
 }
 
@@ -57,6 +58,7 @@ pub struct ProxyPool {
     /// Unix timestamp of last DB refresh.
     last_refreshed: RwLock<i64>,
     /// Refresh interval in seconds (from `proxy.refresh_interval` setting).
+    #[allow(dead_code)]
     refresh_interval: i64,
 }
 
@@ -100,6 +102,7 @@ impl ProxyPool {
     }
 
     /// Pick the next proxy via round-robin.  Returns `None` if the pool is empty.
+    #[allow(dead_code)]
     pub fn next(&self) -> Option<ProxyEntry> {
         let pool = self.proxies.read().unwrap();
         if pool.is_empty() { return None; }
@@ -141,6 +144,7 @@ impl ProxyPool {
 
     /// Trigger a DB refresh if the pool is empty or the refresh interval
     /// has elapsed.  Returns `true` if a refresh was performed.
+    #[allow(dead_code)]
     pub fn maybe_refresh(&self, db: &Database) -> bool {
         let now = now_secs();
         let last = *self.last_refreshed.read().unwrap();

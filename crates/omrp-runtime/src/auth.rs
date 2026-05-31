@@ -72,6 +72,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(dead_code)]
     pub fn new(db: Database, jwt_secret: impl Into<String>) -> Self {
         Self {
             db,

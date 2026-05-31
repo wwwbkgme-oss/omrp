@@ -13,19 +13,22 @@
 //! `/`               | none       | SPA (admin/user dashboard)            |
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, HeaderValue, Request, StatusCode},
     response::{Html, IntoResponse, Json, Response},
     routing::{delete, get, post, put},
     Router,
 };
-use serde::{Deserialize, Serialize};
+use bytes::Bytes;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::task;
+use tokio_stream::wrappers::ReceiverStream;
+use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::auth::{
@@ -34,8 +37,7 @@ use crate::auth::{
 };
 use crate::config::Config;
 use crate::db::{ApiKeyPermissions, ApiKeyRow, Database, ProviderKeyRow, UserRow};
-use crate::provider::CompatClient;
-use crate::routing::{bootstrap_pipeline, select_for_tier, tier_from_str, tier_model_ids};
+use crate::routing::{bootstrap_pipeline, select_for_tier, tier_model_ids};
 use omrp_core::classifier::{classify_prompt, detect_mode_override};
 use omrp_core::router::RouterEngine;
 use omrp_types::task::RouteRequest;
@@ -53,6 +55,13 @@ fn ok(body: Value) -> Response {
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 pub fn build_router(state: Arc<AppState>) -> Router {
+    // CORS: allow all origins so browser tools can call /v1/
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers(Any);
+
     Router::new()
         // ── SPA ──────────────────────────────────────────────────────────────
         .route("/",          get(serve_spa))
@@ -116,6 +125,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/stats",  get(server_stats))
         .with_state(state)
+        .layer(cors)
 }
 
 /// Start the axum server.  Blocks until the server stops.
@@ -240,7 +250,7 @@ async fn auth_login(
         Ok(resp) => {
             let cookie = auth_cookie(&resp.token, expiry);
             let mut headers = HeaderMap::new();
-            headers.insert("Set-Cookie", cookie.parse().unwrap());
+            if let Ok(v) = cookie.parse::<HeaderValue>() { headers.insert("Set-Cookie", v); }
             (StatusCode::OK, headers, Json(json!({
                 "token":    resp.token,
                 "user_id":  resp.user_id,
@@ -254,7 +264,7 @@ async fn auth_login(
 
 async fn auth_logout() -> Response {
     let mut headers = HeaderMap::new();
-    headers.insert("Set-Cookie", logout_cookie().parse().unwrap());
+    if let Ok(v) = logout_cookie().parse::<HeaderValue>() { headers.insert("Set-Cookie", v); }
     (StatusCode::OK, headers, Json(json!({ "status": "ok" }))).into_response()
 }
 
@@ -410,6 +420,7 @@ async fn admin_create_user(
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct UpdateUserRequest {
     display_name: Option<String>,
     email:        Option<String>,
@@ -1011,7 +1022,7 @@ async fn admin_proxy_stats(
             "total":     total,
             "ok":        ok_c,
             "err":       total - ok_c,
-            "success_pct": if *total > 0 { (ok_c * 100 / total) } else { 100 },
+            "success_pct": if *total > 0 { ok_c * 100 / total } else { 100 },
             "users":     users,
             "last_used": last,
         })).collect::<Vec<_>>(),
@@ -1156,7 +1167,7 @@ async fn user_revoke_provider_key(
 // ─── User: stats + profile ────────────────────────────────────────────────────
 
 async fn user_stats(
-    State(state): State<Arc<AppState>>, user: AuthUser,
+    State(state): State<Arc<AppState>>, _user: AuthUser,
 ) -> Response {
     let stats = state.db.usage_stats(30).unwrap_or_default();
     ok(json!({ "daily": stats.iter().map(|(d,r,e,t)| json!({
@@ -1178,6 +1189,7 @@ async fn user_profile(
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct UpdateProfileRequest {
     display_name: Option<String>,
     email:        Option<String>,
@@ -1224,7 +1236,7 @@ async fn proxy_completions(
     // Resolve caller's API key permissions
     let caller_perms: ApiKeyPermissions = if let Some(ref u) = maybe_user.0 {
         match u.api_key_id.as_deref() {
-            Some(kid) => {
+            Some(_kid) => {
                 // Find by key ID to get permissions
                 match state.db.get_user_api_key(&u.user_id) {
                     Ok(Some(k)) => ApiKeyPermissions::from_json(&k.permissions),
@@ -1258,7 +1270,7 @@ async fn proxy_completions(
         Ok(b)  => b,
         Err(_) => return err(StatusCode::BAD_REQUEST, "Cannot read request body"),
     };
-    let mut body: Value = match serde_json::from_slice(&body_bytes) {
+    let body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v)  => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("JSON parse error: {e}")),
     };
@@ -1341,7 +1353,74 @@ async fn proxy_completions(
             .unwrap_or_default()
     });
 
-    // ── Dispatch with transparent proxy rotation on 429 ───────────────────────
+    // ── STREAMING PATH (SSE) ─────────────────────────────────────────────────
+    // When client sends "stream":true, pipe SSE bytes directly from provider.
+    // Proxy rotation applies: on 429 we switch proxy immediately.
+    if streaming {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(256);
+        let pool2 = pool.clone(); let db3 = db2.clone();
+        let api3 = api_key_str.clone(); let prov3 = prov.clone();
+        let routed3 = routed.clone(); let _tier3 = tier_out.clone();
+        let uid3 = uid_opt.clone(); let the_key3 = the_key_id.clone();
+        let ubody = json!({
+            "model": routed, "messages": msgs,
+            "max_tokens": max_tokens.unwrap_or(2048), "stream": true,
+        });
+        task::spawn_blocking(move || {
+            use std::io::Read;
+            use omrp_events::error::ProviderError;
+            use crate::provider::{CompatClient, format_provider_error};
+            let pa = use_bypass && !pool2.is_empty();
+            let tot = if pa { 1 + 12usize.min(pool2.len()) } else { 1 };
+            let mut pu = 0i64;
+            for attempt in (if pa {1} else {0})..tot {
+                let c = if api3.is_empty() {
+                    match CompatClient::for_provider(&prov3) { Ok(x)=>x, Err(_)=>break }
+                } else {
+                    match CompatClient::from_key_and_provider(&prov3, &api3) { Ok(x)=>x, Err(_)=>break }
+                };
+                let c = if attempt > 0 || pa {
+                    match pool2.nth(if pa { attempt-1 } else { attempt }) {
+                        Some(ref p) => { pu=p.id; c.with_proxy(&p.url) }
+                        None => break,
+                    }
+                } else { pu=0; c };
+                match c.stream_request(&ubody) {
+                    Ok(mut rdr) => {
+                        if pu>0 { pool2.mark_success(pu,&db3); pool2.advance(attempt); }
+                        let _ = db3.log_proxy_request(if pu>0{Some(pu)}else{None},None,&routed3,&prov3,uid3.as_deref(),the_key3.as_deref(),true,0,now_secs() as i64);
+                        let mut buf=[0u8;8192];
+                        loop {
+                            match rdr.read(&mut buf) {
+                                Ok(0)  => break,
+                                Ok(n)  => { if tx.blocking_send(Ok(Bytes::copy_from_slice(&buf[..n]))).is_err(){break;} }
+                                Err(e) => { let _=tx.blocking_send(Err(e)); break; }
+                            }
+                        }
+                        return;
+                    }
+                    Err(ProviderError::RateLimited{..}) => {}
+                    Err(ProviderError::Auth(_)) => break,
+                    Err(e) => { if pu>0{pool2.mark_failure(pu,&db3);} eprintln!("[stream] {}", format_provider_error(&e)); }
+                }
+            }
+            let _ = pu; // suppress unused-assignment warning on loop exit
+        });
+        let stream = ReceiverStream::new(rx);
+        return axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("connection", "keep-alive")
+            .header("x-accel-buffering", "no")
+            .header("access-control-allow-origin", "*")
+            .header("x-omrp-model", &routed)
+            .header("x-omrp-tier",  &tier_str)
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "stream error"));
+    }
+
+    // ── NON-STREAMING DISPATCH ───────────────────────────────────────────────
     //
     // Attempt 0 — direct (no proxy)
     // Attempt N — route through pool[cursor + N-1] to present a new source IP
@@ -1477,6 +1556,9 @@ async fn proxy_completions(
                 }
             }
         }
+        // Discard any loop-final values that weren't consumed on success
+        let _ = proxy_used;
+        let _ = proxy_url_used;
 
         // All attempts failed
         let _ = db2.log_request(

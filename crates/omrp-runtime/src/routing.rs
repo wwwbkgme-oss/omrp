@@ -11,10 +11,10 @@ use omrp_core::pipeline::EventPipeline;
 use omrp_core::router::RouterEngine;
 use omrp_core::state::State;
 use omrp_types::routing::RoutingDecision;
+use omrp_events::event::Event;
 use omrp_types::task::RouteRequest;
 
 use crate::config::Config;
-use omrp_events::event::{Event, ModelSource};
 
 // ─── Pipeline bootstrap ───────────────────────────────────────────────────────
 
@@ -37,6 +37,7 @@ pub fn bootstrap_pipeline(cfg: &Config) -> EventPipeline {
 }
 
 /// Persist the pipeline ledger, printing a warning on failure.
+#[allow(dead_code)]
 pub fn save_ledger(pipeline: &EventPipeline, path: &Path) {
     if let Err(e) = pipeline.save_to_ledger(path) {
         eprintln!("Warning: could not save ledger: {e}");
@@ -46,6 +47,7 @@ pub fn save_ledger(pipeline: &EventPipeline, path: &Path) {
 // ─── Prompt utilities ─────────────────────────────────────────────────────────
 
 /// Rough token estimate: 1 token ≈ 4 bytes of UTF-8.
+#[allow(dead_code)]
 pub fn estimate_tokens(text: &str) -> u32 {
     (text.len() as u32 / 4).max(1)
 }

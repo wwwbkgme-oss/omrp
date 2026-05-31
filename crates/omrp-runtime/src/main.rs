@@ -14,11 +14,9 @@ mod auth;
 mod config;
 mod dashboard;
 mod db;
-mod keys;
 mod provider;
 mod proxy;
 mod routing;
-mod server;
 mod web_server;
 
 use std::path::Path;
