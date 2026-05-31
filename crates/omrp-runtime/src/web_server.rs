@@ -84,6 +84,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/audit-logs",         get(admin_audit_logs))
         .route("/api/admin/proxies",            get(admin_list_proxies))
         .route("/api/admin/proxies/refresh",    post(admin_refresh_proxies))
+        // ── Admin: model health + routing intelligence ─────────────────────────
+        .route("/api/admin/models/health",  get(admin_model_health))
+        .route("/api/admin/routing/stats",  get(admin_routing_stats))
+        // ── Admin: per-user stats ─────────────────────────────────────────────
+        .route("/api/admin/users/:id/stats", get(admin_user_stats))
         // ── User: personal API keys ────────────────────────────────────────────
         .route("/api/user/api-keys",     get(user_list_api_keys).post(user_create_api_key))
         .route("/api/user/api-keys/:id", delete(user_revoke_api_key))
@@ -667,6 +672,192 @@ async fn admin_refresh_proxies(
         "status":  "ok",
         "message": "Proxy refresh started — pool will reload automatically",
         "count_before": state.proxy_pool.len()
+    }))
+}
+
+// ─── Admin: model health / Bayesian routing intelligence ─────────────────────
+
+/// `GET /api/admin/models/health`
+///
+/// Returns every registered model with its full Bayesian health profile:
+/// - α/β counts, posterior competence, Wilson Score lower bound
+/// - Beta variance stability, latency EMA, inflight
+/// - Deterministic BKG-FMR score (all 5 factors) from the last ledger snapshot
+/// - Thompson Sampling seed (ledger sequence) for reproducibility
+async fn admin_model_health(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    let cfg = state.cfg.clone();
+    let result = task::spawn_blocking(move || {
+        let pipeline = crate::routing::bootstrap_pipeline(&cfg);
+        let router   = omrp_core::router::RouterEngine::default();
+        let request  = RouteRequest::default();
+
+        let (models_data, selected, fallback_chain, ledger_len, ts_seed) =
+            pipeline.state().read(|s| {
+                let decision  = router.select(s, &request);
+                let ledger_len = pipeline.event_log().len();
+                // Thompson sampling seed (matches select_thompson logic)
+                let ts_seed = s.diagnostics.total_completions
+                    .wrapping_add(s.diagnostics.total_failures.wrapping_mul(2_654_435_761));
+
+                let models_data: Vec<Value> = s.models.iter().map(|m| {
+                    let h        = s.health.get(&m.id).cloned().unwrap_or_default();
+                    let inflight = s.inflight.get(&m.id).copied().unwrap_or(0);
+                    let score_e  = decision.scores.iter().find(|sc| sc.model_id == m.id);
+
+                    let factors: Vec<Value> = score_e.map(|sc| sc.factors.iter().map(|f| json!({
+                        "name":         f.name,
+                        "value":        f.value,
+                        "weight":       f.weight,
+                        "contribution": f.contribution(),
+                    })).collect()).unwrap_or_default();
+
+                    json!({
+                        "id":                  m.id,
+                        "provider":            m.provider,
+                        "context_window":      m.capabilities.context_window,
+                        "tasks":               m.capabilities.task_suitability.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+                        "score":               score_e.map(|sc| sc.total).unwrap_or(0.0),
+                        "is_garbage":          h.garbage,
+                        "inflight":            inflight,
+                        "success_count":       h.success_count,
+                        "failure_count":       h.failure_count,
+                        "total_obs":           h.total_obs(),
+                        "bayesian_competence": h.bayesian_competence(),
+                        "wilson_lower":        h.wilson_lower(),
+                        "beta_stability":      h.stability_score(),
+                        "beta_variance":       h.beta_variance(),
+                        "latency_ms":          h.rolling_latency_avg_ms,
+                        "success_ratio":       h.success_ratio,
+                        "factors":             factors,
+                    })
+                }).collect();
+
+                (models_data,
+                 decision.selected_model.clone(),
+                 decision.fallback_chain.clone(),
+                 ledger_len,
+                 ts_seed)
+            });
+
+        json!({
+            "models":          models_data,
+            "selected":        selected,
+            "fallback_chain":  fallback_chain,
+            "ledger_events":   ledger_len,
+            "ts_seed":         ts_seed,
+        })
+    }).await;
+
+    match result {
+        Ok(v)  => ok(v),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// `GET /api/admin/routing/stats`
+///
+/// Returns aggregate routing analytics: total completions, failures, fallbacks,
+/// garbage models, ledger chain length, and 30-day request statistics.
+async fn admin_routing_stats(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    let cfg = state.cfg.clone();
+
+    // Get ledger/routing stats from the in-memory pipeline
+    let routing = task::spawn_blocking(move || {
+        let pipeline = crate::routing::bootstrap_pipeline(&cfg);
+        pipeline.state().read(|s| {
+            let garbage_count = s.health.values().filter(|h| h.garbage).count();
+            json!({
+                "total_completions": s.diagnostics.total_completions,
+                "total_failures":    s.diagnostics.total_failures,
+                "total_fallbacks":   s.diagnostics.total_fallbacks,
+                "total_degradations": s.diagnostics.total_degradations,
+                "garbage_count":     garbage_count,
+                "model_count":       s.models.len(),
+                "ledger_events":     pipeline.event_log().len(),
+            })
+        })
+    }).await.unwrap_or_else(|_| json!({}));
+
+    // Get DB request stats
+    let daily = state.db.usage_stats(30).unwrap_or_default();
+    let total_req: i64 = daily.iter().map(|d| d.1).sum();
+    let total_err: i64 = daily.iter().map(|d| d.2).sum();
+    let total_tok: i64 = daily.iter().map(|d| d.3).sum();
+    let top_models: Vec<Value> = state.db.top_models(10).unwrap_or_default()
+        .into_iter().map(|(id, reqs, toks)| json!({
+            "model_id": id, "requests": reqs, "tokens": toks
+        })).collect();
+
+    ok(json!({
+        "routing":     routing,
+        "db_stats": {
+            "requests_30d": total_req,
+            "errors_30d":   total_err,
+            "tokens_30d":   total_tok,
+        },
+        "top_models": top_models,
+        "daily": daily.iter().map(|(d,r,e,t)| json!({
+            "date":     d,
+            "requests": r,
+            "errors":   e,
+            "tokens":   t,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// `GET /api/admin/users/:id/stats`
+///
+/// Returns per-user request statistics from request_logs.
+async fn admin_user_stats(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Path(uid): Path<String>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    // Verify user exists
+    let target = match state.db.find_user_by_id(&uid) {
+        Ok(Some(u)) => u,
+        Ok(None)    => return err(StatusCode::NOT_FOUND, "User not found"),
+        Err(e)      => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    // Get their API keys (for key count)
+    let key_count = state.db.list_api_keys_for_user(&uid)
+        .map(|k| k.iter().filter(|k| k.is_active).count())
+        .unwrap_or(0);
+    let prov_key_count = state.db.list_provider_keys_for_user(&uid)
+        .map(|k| k.iter().filter(|k| !k.is_global).count())
+        .unwrap_or(0);
+
+    // Per-user daily stats from request_logs
+    let daily = state.db.user_usage_stats(&uid, 30).unwrap_or_default();
+    let total_req: i64 = daily.iter().map(|d| d.1).sum();
+    let total_err: i64 = daily.iter().map(|d| d.2).sum();
+    let total_tok: i64 = daily.iter().map(|d| d.3).sum();
+
+    ok(json!({
+        "user": {
+            "id":           target.id,
+            "username":     target.username,
+            "display_name": target.display_name,
+            "email":        target.email,
+            "is_admin":     target.is_admin,
+            "is_active":    target.is_active,
+            "created_at":   target.created_at,
+            "last_login":   target.last_login,
+        },
+        "api_keys":      key_count,
+        "provider_keys": prov_key_count,
+        "requests_30d":  total_req,
+        "errors_30d":    total_err,
+        "tokens_30d":    total_tok,
+        "daily": daily.iter().map(|(d,r,e,t)| json!({
+            "date": d, "requests": r, "errors": e, "tokens": t
+        })).collect::<Vec<_>>(),
     }))
 }
 

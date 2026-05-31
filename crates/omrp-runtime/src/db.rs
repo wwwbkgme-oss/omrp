@@ -726,6 +726,41 @@ impl Database {
             .collect::<SqlResult<Vec<_>>>()?;
         Ok(result)
     }
+
+    /// Per-user request statistics for the last `days` days.
+    /// Returns `(date, requests, errors, tokens)`.
+    pub fn user_usage_stats(&self, user_id: &str, days: i64)
+        -> SqlResult<Vec<(String, i64, i64, i64)>>
+    {
+        let since = now_secs() - days * 86400;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT date(created_at, 'unixepoch') as day,
+                    COUNT(*) as reqs,
+                    SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) as errs,
+                    SUM(tokens_in + tokens_out) as tokens
+             FROM request_logs
+             WHERE user_id=?1 AND created_at >= ?2
+             GROUP BY day ORDER BY day ASC",
+        )?;
+        let result: Vec<(String, i64, i64, i64)> = stmt
+            .query_map(params![user_id, since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<SqlResult<Vec<_>>>()?;
+        Ok(result)
+    }
+
+    /// Top-N models by request count (all-time) from request_logs.
+    pub fn top_models(&self, limit: i64) -> SqlResult<Vec<(String, i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT model_id, COUNT(*) as reqs, SUM(tokens_in+tokens_out) as tokens
+             FROM request_logs GROUP BY model_id ORDER BY reqs DESC LIMIT ?1",
+        )?;
+        let result: Vec<(String, i64, i64)> = stmt
+            .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<SqlResult<Vec<_>>>()?;
+        Ok(result)
+    }
 }
 
 // ─── CRUD: Proxies ────────────────────────────────────────────────────────────
