@@ -234,8 +234,9 @@ CREATE TABLE IF NOT EXISTS request_logs (
     error_msg   TEXT,
     created_at  INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_req_created ON request_logs(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_req_user    ON request_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_req_created  ON request_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_req_user     ON request_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_req_api_key  ON request_logs(api_key_id);
 -- Per-proxy request tracking: maps each LLM call to the proxy IP used
 CREATE TABLE IF NOT EXISTS proxy_requests (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
