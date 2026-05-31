@@ -17,7 +17,7 @@ use argon2::{
 };
 use axum::{
     async_trait,
-    extract::{FromRequestParts, State},
+    extract::{FromRequestParts},
     http::{request::Parts, StatusCode},
     response::{IntoResponse, Json, Response},
 };
@@ -66,6 +66,9 @@ pub struct AppState {
     pub db:         Database,
     pub jwt_secret: String,
     pub cfg:        std::sync::Arc<crate::config::Config>,
+    /// Shared proxy pool for rate-limit bypass.  Arc so all request handlers
+    /// share the same round-robin cursor and health state.
+    pub proxy_pool: std::sync::Arc<crate::proxy::ProxyPool>,
 }
 
 impl AppState {
@@ -73,7 +76,8 @@ impl AppState {
         Self {
             db,
             jwt_secret: jwt_secret.into(),
-            cfg: std::sync::Arc::new(crate::config::Config::builtin_defaults()),
+            cfg:        std::sync::Arc::new(crate::config::Config::builtin_defaults()),
+            proxy_pool: crate::proxy::ProxyPool::new(3600),
         }
     }
 }

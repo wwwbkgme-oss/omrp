@@ -124,14 +124,48 @@ pub async fn run(cfg: Config, host: &str, port: u16) {
         }
     };
 
-    let state = Arc::new(AppState { db, jwt_secret, cfg: Arc::new(cfg) });
-    let app   = build_router(state);
-    let addr  = format!("{host}:{port}");
+    // Build proxy pool — load from DB if proxy.enabled = 1
+    let refresh_interval: i64 = db.get_setting("proxy.refresh_interval")
+        .unwrap_or(None).and_then(|s| s.parse().ok()).unwrap_or(3600);
+    let proxy_pool = crate::proxy::ProxyPool::new(refresh_interval);
+    let proxy_enabled = db.get_setting("proxy.enabled")
+        .unwrap_or(None).map(|v| v == "1").unwrap_or(false);
+    if proxy_enabled {
+        proxy_pool.load(&db);
+        eprintln!("[proxy] enabled — {} proxies loaded", proxy_pool.len());
+    } else {
+        eprintln!("[proxy] disabled (enable: Admin → Settings → proxy.enabled = 1)");
+    }
+
+    let state = Arc::new(AppState {
+        db,
+        jwt_secret,
+        cfg: Arc::new(cfg),
+        proxy_pool,
+    });
+
+    // If enabled but pool was empty, trigger a background refresh
+    if proxy_enabled && state.proxy_pool.is_empty() {
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            if let Some(url) = state2.db.get_setting("proxy.source_url").unwrap_or(None) {
+                let s = state2.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::proxy::refresh_proxy_pool(&s.db, &url);
+                    s.proxy_pool.load(&s.db);
+                }).await.ok();
+            }
+        });
+    }
+
+    let app  = build_router(state.clone());
+    let addr = format!("{host}:{port}");
 
     println!("OMRP  \x1b[36mhttp://{addr}\x1b[0m");
     println!("  Dashboard   http://{addr}/");
     println!("  API         http://{addr}/v1/chat/completions");
     println!("  Setup       http://{addr}/setup  (if first run)");
+    println!("  Proxy pool  {} active proxies", state.proxy_pool.len());
     println!();
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -832,21 +866,39 @@ async fn proxy_completions(
         .unwrap_or(None);
 
     let routed = routed_model.clone();
-    let prov   = prov_name.clone();
-    let tier_out = tier_str.clone();
-    let db2    = state.db.clone();
-    let uid_opt = maybe_user.0.as_ref().map(|u| u.user_id.clone());
+    let prov      = prov_name.clone();
+    let tier_out  = tier_str.clone();
+    let db2       = state.db.clone();
+    let uid_opt   = maybe_user.0.as_ref().map(|u| u.user_id.clone());
+    let pool      = state.proxy_pool.clone();
 
-    // ── Dispatch (blocking) ───────────────────────────────────────────────────
+    // Resolve the API key string once, before entering spawn_blocking.
+    // This lets us rebuild CompatClient for every proxy retry without
+    // re-querying the DB or re-reading env vars.
+    let api_key_str: String = db_key.unwrap_or_else(|| {
+        crate::provider::ProviderKind::from_str(&prov)
+            .and_then(|k| std::env::var(k.api_key_env()).ok())
+            .unwrap_or_default()
+    });
+
+    // ── Dispatch with transparent proxy rotation on 429 ───────────────────────
+    //
+    // Attempt 0 — direct (no proxy)
+    // Attempt N — route through pool[cursor + N-1] to present a new source IP
+    //
+    // On 429: advance to next proxy immediately (zero sleep), because the
+    //   rate limit is per-IP — a different IP gets a fresh quota.
+    // On network/timeout: mark_failure(proxy) so it's removed from the pool,
+    //   then try the next entry.
+    // On auth / model-not-found: break immediately (rotating IPs won't help).
+
+    const MAX_PROXY_ATTEMPTS: usize = 12;
+
     let result: Result<Result<crate::provider::CompletionResult, String>, _> =
         task::spawn_blocking(move || -> Result<crate::provider::CompletionResult, String> {
-        // Build client — prefer DB key, fall back to env
-        let client = if let Some(key_val) = db_key {
-            crate::provider::CompatClient::from_key_and_provider(&prov, &key_val)
-        } else {
-            crate::provider::CompatClient::for_provider(&prov)
-        };
-        let client = client.map_err(|e| e.to_string())?;
+
+        use omrp_events::error::ProviderError;
+        use crate::provider::{CompatClient, format_provider_error};
 
         let msgs_typed: Vec<crate::provider::Message> = msgs.iter().map(|m| {
             crate::provider::Message {
@@ -855,31 +907,112 @@ async fn proxy_completions(
             }
         }).collect();
 
-        let started = std::time::Instant::now();
-        let result  = client.complete_with_retry(&routed, &msgs_typed, max_tokens);
-        let latency = started.elapsed().as_millis() as i64;
+        let proxy_available = !pool.is_empty();
+        // Attempt 0 = direct; 1..=MAX = via proxy
+        let total_attempts = if proxy_available {
+            1 + MAX_PROXY_ATTEMPTS.min(pool.len())
+        } else {
+            1
+        };
 
-        match result {
-            Ok(cr) => {
-                let _ = db2.log_request(
-                    uid_opt.as_deref(), None,
-                    &routed, &prov, None, Some(&tier_out),
-                    0, cr.tokens_used as i64, latency, true, None,
-                    now_secs() as i64,
-                );
-                Ok(cr)
-            }
-            Err(e) => {
-                let msg = crate::provider::format_provider_error(&e);
-                let _ = db2.log_request(
-                    uid_opt.as_deref(), None,
-                    &routed, &prov, None, Some(&tier_out),
-                    0, 0, latency, false, Some(&msg),
-                    now_secs() as i64,
-                );
-                Err(msg)
+        let mut last_err   = String::from("no attempt made");
+        let mut proxy_used = 0i64; // DB id of the proxy used in current attempt
+
+        for attempt in 0..total_attempts {
+            // ── Build client for this attempt ─────────────────────────────────
+            let client = if api_key_str.is_empty() {
+                match CompatClient::for_provider(&prov) {
+                    Ok(c)  => c,
+                    Err(e) => return Err(e),
+                }
+            } else {
+                match CompatClient::from_key_and_provider(&prov, &api_key_str) {
+                    Ok(c)  => c,
+                    Err(e) => return Err(e),
+                }
+            };
+
+            // Attach proxy for attempts 1+
+            let client = if attempt > 0 {
+                match pool.nth(attempt - 1) {
+                    Some(ref p) => {
+                        proxy_used = p.id;
+                        eprintln!("[proxy] attempt {attempt}: {}", p.url);
+                        client.with_proxy(&p.url)
+                    }
+                    None => break, // pool exhausted
+                }
+            } else {
+                proxy_used = 0;
+                client
+            };
+
+            // ── Make the request ──────────────────────────────────────────────
+            let started = std::time::Instant::now();
+            let res     = client.complete_with_retry(&routed, &msgs_typed, max_tokens);
+            let latency = started.elapsed().as_millis() as i64;
+
+            match res {
+                Ok(cr) => {
+                    // Success — advance pool cursor so the next request doesn't
+                    // re-use the same proxy batch that hit rate limits.
+                    if attempt > 0 {
+                        pool.mark_success(proxy_used, &db2);
+                        pool.advance(attempt);
+                    }
+                    let _ = db2.log_request(
+                        uid_opt.as_deref(), None,
+                        &routed, &prov, None, Some(&tier_out),
+                        0, cr.tokens_used as i64, latency, true, None,
+                        now_secs() as i64,
+                    );
+                    return Ok(cr);
+                }
+
+                Err(ProviderError::RateLimited { .. }) => {
+                    // 429 — this IP is rate-limited.  Don't mark the proxy as
+                    // failed (it works, just not for us right now).  Move on.
+                    if attempt > 0 {
+                        eprintln!("[proxy] 429 on proxy id={proxy_used}, trying next");
+                    } else {
+                        eprintln!("[proxy] 429 on direct, trying proxy pool");
+                    }
+                    last_err = "rate_limited".into();
+                    // continue to next attempt
+                }
+
+                Err(ProviderError::Network(_)) | Err(ProviderError::Timeout(_)) => {
+                    // Network/timeout — this proxy is broken; remove it.
+                    if attempt > 0 {
+                        eprintln!("[proxy] network/timeout on proxy id={proxy_used}");
+                        pool.mark_failure(proxy_used, &db2);
+                    }
+                    last_err = format_provider_error(res.as_ref().unwrap_err());
+                    // continue to next attempt
+                }
+
+                Err(ref e @ (ProviderError::Auth(_) | ProviderError::ModelNotFound(_))) => {
+                    // Auth/model errors are not proxy-related — break immediately.
+                    last_err = format_provider_error(e);
+                    break;
+                }
+
+                Err(ref e) => {
+                    last_err = format_provider_error(e);
+                    // Other errors: try one more proxy, then give up
+                    if attempt >= 2 { break; }
+                }
             }
         }
+
+        // All attempts failed
+        let _ = db2.log_request(
+            uid_opt.as_deref(), None,
+            &routed, &prov, None, Some(&tier_out),
+            0, 0, 0, false, Some(&last_err),
+            now_secs() as i64,
+        );
+        Err(last_err)
     }).await;
 
     match result {
