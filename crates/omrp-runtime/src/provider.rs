@@ -34,14 +34,23 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    /// Resolve from the string stored in config (`provider = "groq"`).
+    /// Resolve from the string stored in config (`provider = "groq"`)
+    /// or from a model id prefix (e.g. `"openrouter/auto"` → `openrouter`).
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
+        // Try exact provider name first, then extract prefix from model IDs
+        let lower = s.to_lowercase();
+        let prefix = lower.split('/').next().unwrap_or(&lower);
+        match prefix {
             "openrouter" => Some(Self::OpenRouter),
             "kilo"       => Some(Self::Kilo),
             "cerebras"   => Some(Self::Cerebras),
             "groq"       => Some(Self::Groq),
             "buw"        => Some(Self::Buw),
+            // well-known model families → infer provider
+            "llama-3.3-70b-versatile" | "llama-3.1-8b-instant"
+            | "mixtral-8x7b-32768" | "qwen-qwq-32b"
+            | "gemma2-9b-it" => Some(Self::Groq),
+            "gpt-oss-120b" | "llama-3.3-70b" => Some(Self::Cerebras),
             _ => None,
         }
     }
@@ -66,6 +75,16 @@ impl ProviderKind {
         }
     }
 
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::Kilo       => "kilo",
+            Self::Cerebras   => "cerebras",
+            Self::Groq       => "groq",
+            Self::Buw        => "buw",
+        }
+    }
+
     #[allow(dead_code)]
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -75,6 +94,49 @@ impl ProviderKind {
             Self::Groq       => "Groq",
             Self::Buw        => "BUW",
         }
+    }
+
+    /// Best free/default models to show in the playground when a key is configured.
+    /// Returned as (model_id, display_hint).
+    pub fn free_models(&self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::OpenRouter => &[
+                ("openrouter/auto",                                    "OR smart router"),
+                ("meta-llama/llama-3.3-70b-instruct:free",             "Llama 3.3 70B free"),
+                ("mistralai/mistral-7b-instruct:free",                 "Mistral 7B free"),
+                ("google/gemma-3-12b-it:free",                         "Gemma 3 12B free"),
+                ("deepseek/deepseek-chat-v3-0324:free",                "DeepSeek v3 free"),
+                ("qwen/qwen3-8b:free",                                 "Qwen 3 8B free"),
+                ("openrouter/quasar-alpha",                            "Quasar Alpha free"),
+            ],
+            Self::Groq => &[
+                ("llama-3.3-70b-versatile",  "Llama 3.3 70B"),
+                ("llama-3.1-8b-instant",     "Llama 3.1 8B"),
+                ("gemma2-9b-it",             "Gemma 2 9B"),
+                ("qwen-qwq-32b",             "Qwen QwQ 32B"),
+            ],
+            Self::Cerebras => &[
+                ("llama-3.3-70b",  "Llama 3.3 70B"),
+                ("llama3.1-8b",    "Llama 3.1 8B"),
+            ],
+            Self::Kilo => &[
+                ("kilo/auto-free", "Kilo auto-free"),
+            ],
+            Self::Buw => &[
+                ("buw/auto", "BUW auto"),
+            ],
+        }
+    }
+
+    /// All known providers in priority order.
+    pub fn all() -> &'static [ProviderKind] {
+        &[
+            ProviderKind::OpenRouter,
+            ProviderKind::Groq,
+            ProviderKind::Cerebras,
+            ProviderKind::Kilo,
+            ProviderKind::Buw,
+        ]
     }
 }
 

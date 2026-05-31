@@ -1572,14 +1572,33 @@ async fn proxy_completions(
         let req2     = RouteRequest { max_inflight_per_model: Some(3), ..Default::default() };
         let tids     = tier_model_ids(&cfg, tier);
         let dec = pipeline.state().read(|s| select_for_tier(s, &req2, tier, &tids, &router));
-        (dec.selected_model, tier.as_str().to_string())
+
+        if !dec.selected_model.is_empty() {
+            (dec.selected_model, tier.as_str().to_string())
+        } else {
+            // ── Config pipeline empty → fall back to first available DB key ──
+            // Check providers in priority order; pick the first with an active key.
+            use crate::provider::ProviderKind;
+            let uid_ref = maybe_user.0.as_ref().map(|u| u.user_id.as_str());
+            let fallback = ProviderKind::all().iter().find_map(|prov| {
+                let key = state.db
+                    .resolve_provider_key(prov.to_str(), uid_ref)
+                    .unwrap_or(None)
+                    .or_else(|| std::env::var(prov.api_key_env()).ok());
+                key.map(|_| {
+                    let model = prov.free_models().first().map(|(m,_)| *m).unwrap_or("auto");
+                    (model.to_string(), prov.to_str().to_string())
+                })
+            });
+            match fallback {
+                Some((model, _prov)) => (model, tier.as_str().to_string()),
+                None => return err(StatusCode::SERVICE_UNAVAILABLE,
+                    "No provider keys configured. Add a key in Admin → Provider Keys."),
+            }
+        }
     } else {
         (model_hint.clone(), "explicit".to_string())
     };
-
-    if routed_model.is_empty() {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "No models available");
-    }
 
     // Check allowed_models permission
     if !caller_perms.allowed_models.is_empty()
@@ -1590,9 +1609,14 @@ async fn proxy_completions(
     }
 
     // ── Find provider name ────────────────────────────────────────────────────
+    // Priority: config file entry → model-id prefix → fallback to openrouter
     let prov_name = cfg.model.iter()
         .find(|m| m.id == routed_model)
         .map(|m| m.provider.clone())
+        .or_else(|| {
+            use crate::provider::ProviderKind;
+            ProviderKind::from_str(&routed_model).map(|p| p.to_str().to_string())
+        })
         .unwrap_or_else(|| "openrouter".into());
 
     // ── Resolve provider API key (DB first, then env) ─────────────────────────
@@ -1859,14 +1883,47 @@ async fn proxy_completions(
 /// `GET /v1/models` — list available models in OpenAI format.
 async fn proxy_models(State(state): State<Arc<AppState>>) -> Response {
     let now = now_secs();
+    let uid: Option<String> = None; // /v1/models is public; no user-scoping needed
+
+    // ── Always include omrp routing aliases ──────────────────────────────────
     let mut models = vec![
-        json!({"id":"auto",           "object":"model","created":now,"owned_by":"omrp"}),
         json!({"id":"omrp/auto",      "object":"model","created":now,"owned_by":"omrp"}),
         json!({"id":"omrp/auto-free", "object":"model","created":now,"owned_by":"omrp"}),
     ];
+
+    // ── Config-file models (may be empty on fresh installs) ──────────────────
+    let mut seen = std::collections::HashSet::<String>::new();
     for m in &state.cfg.model {
-        models.push(json!({"id": m.id, "object": "model", "created": now, "owned_by": m.provider}));
+        if seen.insert(m.id.clone()) {
+            models.push(json!({"id": m.id, "object": "model", "created": now, "owned_by": m.provider}));
+        }
     }
+
+    // ── DB provider keys → add each provider's known free models ─────────────
+    // Only include models for providers that actually have an active key
+    // (either in the DB or as an environment variable).
+    use crate::provider::ProviderKind;
+    for prov in ProviderKind::all() {
+        let has_key = state.db
+            .resolve_provider_key(prov.to_str(), uid.as_deref())
+            .unwrap_or(None)
+            .is_some()
+            || std::env::var(prov.api_key_env()).is_ok();
+
+        if has_key {
+            for (model_id, _hint) in prov.free_models() {
+                if seen.insert(model_id.to_string()) {
+                    models.push(json!({
+                        "id":       model_id,
+                        "object":   "model",
+                        "created":  now,
+                        "owned_by": prov.to_str(),
+                    }));
+                }
+            }
+        }
+    }
+
     ok(json!({ "object": "list", "data": models }))
 }
 
