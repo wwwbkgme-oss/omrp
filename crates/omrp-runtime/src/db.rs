@@ -25,6 +25,57 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, Result as SqlResult};
+use serde::{Deserialize, Serialize};
+
+// ─── API Key permissions ──────────────────────────────────────────────────────
+
+/// Fine-grained permissions stored with every API key (as JSON).
+///
+/// These are set by the admin at account-creation time and can be updated.
+/// Each user has exactly **one** API key; this struct defines what they can do.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyPermissions {
+    /// Can use the LLM router endpoint `/v1/chat/completions`.
+    pub can_use_router: bool,
+    /// Route every request through the proxy pool (bypasses per-IP rate limits
+    /// entirely — the user never sees a 429).
+    pub can_use_proxy_bypass: bool,
+    /// Allowed model IDs.  Empty vec = all models permitted.
+    pub allowed_models: Vec<String>,
+    /// Max requests per hour.  0 = unlimited.
+    pub rate_limit_per_hour: u32,
+}
+
+impl Default for ApiKeyPermissions {
+    fn default() -> Self {
+        Self {
+            can_use_router:       true,
+            can_use_proxy_bypass: false,
+            allowed_models:       vec![],
+            rate_limit_per_hour:  0,
+        }
+    }
+}
+
+impl ApiKeyPermissions {
+    /// Admin default: full access with proxy bypass enabled.
+    pub fn admin_default() -> Self {
+        Self {
+            can_use_router:       true,
+            can_use_proxy_bypass: true,
+            allowed_models:       vec![],
+            rate_limit_per_hour:  0,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
+    }
+
+    pub fn from_json(s: &str) -> Self {
+        serde_json::from_str(s).unwrap_or_default()
+    }
+}
 
 // ─── Database handle ──────────────────────────────────────────────────────────
 
@@ -55,7 +106,12 @@ impl Database {
     /// Run all DDL migrations (idempotent).
     pub fn migrate(&self) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(SCHEMA_SQL)
+        conn.execute_batch(SCHEMA_SQL)?;
+        // Additive column migrations (safe to run multiple times)
+        let _ = conn.execute("ALTER TABLE api_keys ADD COLUMN permissions TEXT NOT NULL DEFAULT '{}'", []);
+        let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN proxy_id INTEGER", []);
+        let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN proxy_url TEXT", []);
+        Ok(())
     }
 
     /// Insert built-in roles, permissions, and default settings.
@@ -126,10 +182,13 @@ CREATE TABLE IF NOT EXISTS api_keys (
     is_active   INTEGER NOT NULL DEFAULT 1,
     created_at  INTEGER NOT NULL,
     last_used   INTEGER,
-    expires_at  INTEGER
+    expires_at  INTEGER,
+    -- Fine-grained permissions JSON: ApiKeyPermissions struct
+    permissions TEXT    NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_user_unique ON api_keys(user_id) WHERE user_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS provider_keys (
     id          TEXT    PRIMARY KEY,
     user_id     TEXT    REFERENCES users(id) ON DELETE CASCADE,
@@ -175,6 +234,22 @@ CREATE TABLE IF NOT EXISTS request_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_req_created ON request_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_req_user    ON request_logs(user_id);
+-- Per-proxy request tracking: maps each LLM call to the proxy IP used
+CREATE TABLE IF NOT EXISTS proxy_requests (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    proxy_id    INTEGER,              -- NULL = direct (no proxy)
+    proxy_url   TEXT,                 -- URL at time of request (kept even if proxy deleted)
+    model_id    TEXT    NOT NULL,
+    provider    TEXT    NOT NULL,
+    user_id     TEXT,
+    api_key_id  TEXT,
+    success     INTEGER NOT NULL DEFAULT 1,
+    latency_ms  INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prx_proxy   ON proxy_requests(proxy_id);
+CREATE INDEX IF NOT EXISTS idx_prx_user    ON proxy_requests(user_id);
+CREATE INDEX IF NOT EXISTS idx_prx_created ON proxy_requests(created_at DESC);
 CREATE TABLE IF NOT EXISTS proxies (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     url         TEXT    UNIQUE NOT NULL,
@@ -247,15 +322,17 @@ pub struct UserRow {
 
 #[derive(Debug, Clone)]
 pub struct ApiKeyRow {
-    pub id:         String,
-    pub user_id:    Option<String>,
-    pub key_hash:   String,
-    pub key_prefix: String,
-    pub label:      String,
-    pub is_active:  bool,
-    pub created_at: i64,
-    pub last_used:  Option<i64>,
-    pub expires_at: Option<i64>,
+    pub id:          String,
+    pub user_id:     Option<String>,
+    pub key_hash:    String,
+    pub key_prefix:  String,
+    pub label:       String,
+    pub is_active:   bool,
+    pub created_at:  i64,
+    pub last_used:   Option<i64>,
+    pub expires_at:  Option<i64>,
+    /// JSON-encoded `ApiKeyPermissions`.
+    pub permissions: String,
 }
 
 #[derive(Debug, Clone)]
@@ -301,15 +378,16 @@ fn map_user(r: &rusqlite::Row<'_>) -> SqlResult<UserRow> {
 
 fn map_api_key(r: &rusqlite::Row<'_>) -> SqlResult<ApiKeyRow> {
     Ok(ApiKeyRow {
-        id:         r.get(0)?,
-        user_id:    r.get(1)?,
-        key_hash:   r.get(2)?,
-        key_prefix: r.get(3)?,
-        label:      r.get(4)?,
-        is_active:  r.get::<_, i64>(5)? != 0,
-        created_at: r.get(6)?,
-        last_used:  r.get(7)?,
-        expires_at: r.get(8)?,
+        id:          r.get(0)?,
+        user_id:     r.get(1)?,
+        key_hash:    r.get(2)?,
+        key_prefix:  r.get(3)?,
+        label:       r.get(4)?,
+        is_active:   r.get::<_, i64>(5)? != 0,
+        created_at:  r.get(6)?,
+        last_used:   r.get(7)?,
+        expires_at:  r.get(8)?,
+        permissions: r.get::<_, Option<String>>(9)?.unwrap_or_else(|| "{}".into()),
     })
 }
 
@@ -480,20 +558,82 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO api_keys
-             (id,user_id,key_hash,key_prefix,label,is_active,created_at,expires_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+             (id,user_id,key_hash,key_prefix,label,is_active,created_at,expires_at,permissions)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 row.id, row.user_id, row.key_hash, row.key_prefix, row.label,
-                row.is_active as i64, row.created_at, row.expires_at,
+                row.is_active as i64, row.created_at, row.expires_at, row.permissions,
             ],
         )?;
         Ok(())
     }
 
+    /// Get the single active API key for a user (each user has exactly one).
+    pub fn get_user_api_key(&self, user_id: &str) -> SqlResult<Option<ApiKeyRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,user_id,key_hash,key_prefix,label,is_active,created_at,last_used,expires_at,permissions
+             FROM api_keys WHERE user_id=?1 AND is_active=1 ORDER BY created_at ASC LIMIT 1",
+        )?;
+        let mut result: Vec<ApiKeyRow> = stmt
+            .query_map(params![user_id], map_api_key)?
+            .collect::<SqlResult<Vec<_>>>()?;
+        Ok(result.pop())
+    }
+
+    /// Create and return the API key for a new user (1 key per account).
+    /// Returns (row, raw_key_shown_once).
+    pub fn create_user_api_key(
+        &self, user_id: &str, label: &str, perms: &ApiKeyPermissions,
+    ) -> SqlResult<(ApiKeyRow, String)> {
+        use rand::RngCore;
+        let mut buf = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut buf);
+        let raw_key: String = format!("omrp-sk-{}", buf.iter().map(|b| format!("{b:02x}")).collect::<String>());
+
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+
+        // SHA-256 hash for storage
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(raw_key.as_bytes());
+        let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+
+        // Short random id
+        let mut id_buf = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut id_buf);
+        let id = format!("omrp_{}", id_buf.iter().map(|b| format!("{b:02x}")).collect::<String>());
+
+        let row = ApiKeyRow {
+            id,
+            user_id:     Some(user_id.to_string()),
+            key_hash:    hash,
+            key_prefix:  raw_key.chars().take(16).collect(),
+            label:       label.to_string(),
+            is_active:   true,
+            created_at:  ts,
+            last_used:   None,
+            expires_at:  None,
+            permissions: perms.to_json(),
+        };
+        self.insert_api_key(&row)?;
+        Ok((row, raw_key))
+    }
+
+    /// Update the permissions of a user's API key.
+    pub fn update_api_key_permissions(&self, key_id: &str, perms: &ApiKeyPermissions) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE api_keys SET permissions=?1 WHERE id=?2",
+            params![perms.to_json(), key_id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn list_api_keys_for_user(&self, user_id: &str) -> SqlResult<Vec<ApiKeyRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,user_id,key_hash,key_prefix,label,is_active,created_at,last_used,expires_at
+            "SELECT id,user_id,key_hash,key_prefix,label,is_active,created_at,last_used,expires_at,permissions
              FROM api_keys WHERE user_id=?1 ORDER BY created_at DESC",
         )?;
         let result: Vec<ApiKeyRow> = stmt
@@ -505,7 +645,7 @@ impl Database {
     pub fn list_all_api_keys(&self) -> SqlResult<Vec<ApiKeyRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,user_id,key_hash,key_prefix,label,is_active,created_at,last_used,expires_at
+            "SELECT id,user_id,key_hash,key_prefix,label,is_active,created_at,last_used,expires_at,permissions
              FROM api_keys ORDER BY created_at DESC",
         )?;
         let result: Vec<ApiKeyRow> = stmt
@@ -517,7 +657,7 @@ impl Database {
     pub fn find_api_key_by_hash(&self, hash: &str) -> SqlResult<Option<ApiKeyRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,user_id,key_hash,key_prefix,label,is_active,created_at,last_used,expires_at
+            "SELECT id,user_id,key_hash,key_prefix,label,is_active,created_at,last_used,expires_at,permissions
              FROM api_keys WHERE key_hash=?1 AND is_active=1",
         )?;
         let mut result: Vec<ApiKeyRow> = stmt
@@ -841,6 +981,90 @@ pub fn default_db_path() -> std::path::PathBuf {
         .join("omrp.db")
 }
 
+// ─── CRUD: Proxy Request Tracking ────────────────────────────────────────────
+
+impl Database {
+    /// Log a single LLM request routed through a proxy (or direct if proxy_id=None).
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_proxy_request(
+        &self,
+        proxy_id:  Option<i64>,
+        proxy_url: Option<&str>,
+        model_id:  &str,
+        provider:  &str,
+        user_id:   Option<&str>,
+        api_key_id: Option<&str>,
+        success:   bool,
+        latency_ms: i64,
+        ts:        i64,
+    ) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO proxy_requests
+             (proxy_id,proxy_url,model_id,provider,user_id,api_key_id,success,latency_ms,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![proxy_id, proxy_url, model_id, provider, user_id, api_key_id,
+                    success as i64, latency_ms, ts],
+        )?;
+        Ok(())
+    }
+
+    /// Per-proxy aggregate stats: (proxy_url, total_requests, successes, unique_users, last_used).
+    pub fn proxy_usage_stats(&self) -> SqlResult<Vec<(String, i64, i64, i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT
+               COALESCE(proxy_url, 'direct') as url,
+               COUNT(*) as total,
+               SUM(success) as ok,
+               COUNT(DISTINCT user_id) as users,
+               MAX(created_at) as last_used
+             FROM proxy_requests
+             GROUP BY COALESCE(proxy_url, 'direct')
+             ORDER BY total DESC
+             LIMIT 100",
+        )?;
+        let result: Vec<(String, i64, i64, i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect::<SqlResult<Vec<_>>>()?;
+        Ok(result)
+    }
+
+    /// Per-proxy detail: top models and users for a specific proxy URL.
+    pub fn proxy_detail_stats(&self, proxy_url: &str)
+        -> SqlResult<(Vec<(String, i64)>, Vec<(String, i64)>)>
+    {
+        let conn = self.conn.lock().unwrap();
+        // Top models
+        let mut stmt = conn.prepare(
+            "SELECT model_id, COUNT(*) as c FROM proxy_requests
+             WHERE COALESCE(proxy_url,'direct')=?1 GROUP BY model_id ORDER BY c DESC LIMIT 5",
+        )?;
+        let models: Vec<(String, i64)> = stmt
+            .query_map(params![proxy_url], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<SqlResult<Vec<_>>>()?;
+        // Top users
+        let mut stmt2 = conn.prepare(
+            "SELECT COALESCE(user_id,'anon'), COUNT(*) as c FROM proxy_requests
+             WHERE COALESCE(proxy_url,'direct')=?1 GROUP BY user_id ORDER BY c DESC LIMIT 5",
+        )?;
+        let users: Vec<(String, i64)> = stmt2
+            .query_map(params![proxy_url], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<SqlResult<Vec<_>>>()?;
+        Ok((models, users))
+    }
+
+    /// Total requests through the proxy pool in the last `hours`.
+    pub fn proxy_requests_recent(&self, hours: i64) -> SqlResult<i64> {
+        let since = now_secs() - hours * 3600;
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM proxy_requests WHERE proxy_id IS NOT NULL AND created_at >= ?1",
+            params![since], |r| r.get(0),
+        )
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -899,6 +1123,7 @@ mod tests {
             key_hash: "deadbeef".into(), key_prefix: "omrp-sk-dead".into(),
             label: "Test".into(), is_active: true,
             created_at: ts, last_used: None, expires_at: None,
+            permissions: "{}".into(),
         };
         db.insert_api_key(&row).unwrap();
         let found = db.find_api_key_by_hash("deadbeef").unwrap().unwrap();
