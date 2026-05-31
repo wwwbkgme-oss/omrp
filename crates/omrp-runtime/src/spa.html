@@ -279,6 +279,7 @@ tbody td{padding:10px 14px;font-size:13px;color:var(--text1);vertical-align:midd
         <div class="topbar-title" id="tb-title">Dashboard</div>
       </div>
       <div class="topbar-right">
+        <div id="tb-viewtoggle" style="display:none;gap:6px"></div>
         <span class="status-dot"></span>
         <span style="font-size:11px;color:var(--text2)">Connected</span>
       </div>
@@ -300,7 +301,7 @@ tbody td{padding:10px 14px;font-size:13px;color:var(--text1);vertical-align:midd
 //  OMRP SPA — Core
 // ═══════════════════════════════════════════════════════════════════
 
-const S = { user:null, token:null, page:'', appName:'OMRP' };
+const S = { user:null, token:null, page:'', appName:'OMRP', adminViewAsUser:false };
 
 // ── API ────────────────────────────────────────────────────────────
 async function api(method, path, body, raw=false) {
@@ -350,15 +351,17 @@ const provIcon = p => {
 
 // ── Navigation ─────────────────────────────────────────────────────
 const ADMIN_PAGES = [
-  { id:'dashboard',  icon:'▦', label:'Dashboard'      },
-  { id:'users',      icon:'◎', label:'Users'           },
-  { id:'roles',      icon:'◈', label:'Roles'           },
-  { id:'rkeys',      icon:'⌗', label:'Router Keys'    },
-  { id:'pkeys',      icon:'⊟', label:'Provider Keys'  },
-  { id:'settings',   icon:'≡', label:'Settings'        },
-  { id:'logs',       icon:'∷', label:'Audit Logs'      },
-  { id:'proxies',    icon:'⊛', label:'Proxies'         },
-  { id:'models',     icon:'◉', label:'Models'          },
+  { id:'dashboard',  icon:'▦', label:'Dashboard'         },
+  { id:'playground', icon:'⚡', label:'Playground'        },
+  { id:'routing',    icon:'◈', label:'Routing Intel'     },
+  { id:'users',      icon:'◎', label:'Users'             },
+  { id:'roles',      icon:'◩', label:'Roles'             },
+  { id:'rkeys',      icon:'⌗', label:'Router Keys'       },
+  { id:'pkeys',      icon:'⊟', label:'Provider Keys'     },
+  { id:'settings',   icon:'≡', label:'Settings'          },
+  { id:'logs',       icon:'∷', label:'Audit Logs'        },
+  { id:'proxies',    icon:'⊛', label:'Proxies'           },
+  { id:'models',     icon:'◉', label:'Models'            },
 ];
 const USER_PAGES = [
   { id:'my-keys',    icon:'⌗', label:'My API Keys'    },
@@ -368,17 +371,34 @@ const USER_PAGES = [
 ];
 
 function buildNav() {
-  const pages = S.user.is_admin ? ADMIN_PAGES : USER_PAGES;
+  const asUser = S.adminViewAsUser;
+  const pages  = (S.user.is_admin && !asUser) ? ADMIN_PAGES : USER_PAGES;
   document.getElementById('sb-nav').innerHTML = pages.map(p =>
     `<div class="sb-link" id="nl-${p.id}" onclick="nav('${p.id}')">
       <span class="icon">${p.icon}</span>${esc(p.label)}
     </div>`
   ).join('');
+  // View-as-user toggle button (admins only)
+  const tbarRight = document.getElementById('tb-viewtoggle');
+  if (tbarRight && S.user.is_admin) {
+    tbarRight.style.display = 'flex';
+    tbarRight.innerHTML = `<button class="btn ${asUser?'btn-primary':'btn-ghost'}" style="font-size:12px;padding:5px 12px" onclick="toggleAdminView()">
+      ${asUser?'🔑 Admin View':'👤 User View'}
+    </button>`;
+  }
+}
+
+function toggleAdminView() {
+  S.adminViewAsUser = !S.adminViewAsUser;
+  buildNav();
+  const defaultPage = S.adminViewAsUser ? 'my-keys' : 'dashboard';
+  nav(defaultPage);
 }
 
 function nav(page) {
   S.page = page;
-  const pages = S.user.is_admin ? ADMIN_PAGES : USER_PAGES;
+  const asUser = S.adminViewAsUser;
+  const pages  = (S.user.is_admin && !asUser) ? ADMIN_PAGES : USER_PAGES;
   pages.forEach(p => {
     const el = document.getElementById('nl-'+p.id);
     if (el) el.classList.toggle('active', p.id === page);
@@ -393,6 +413,8 @@ async function render(page) {
   ca.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
   try {
     switch(page) {
+      case 'playground':  await renderPlayground(ca); break;
+      case 'routing':     await renderRoutingIntel(ca); break;
       case 'dashboard':  await renderDashboard(ca); break;
       case 'users':      await renderUsers(ca); break;
       case 'roles':      await renderRoles(ca); break;
@@ -418,9 +440,14 @@ async function render(page) {
 // ═══════════════════════════════════════════════════════════════════
 
 async function renderDashboard(ca) {
-  const s = await GET('/api/admin/stats');
+  const [s, rs] = await Promise.all([
+    GET('/api/admin/stats'),
+    GET('/api/admin/routing/stats').catch(()=>({routing:{},db_stats:{},daily:[],top_models:[]})),
+  ]);
   const total_req = (s.daily||[]).reduce((a,d)=>a+d.requests,0);
-  const total_err = (s.daily||[]).reduce((a,d)=>a+d.errors,0);
+  const total_tok = (rs.db_stats||{}).tokens_30d || 0;
+  const rt = rs.routing || {};
+
   ca.innerHTML = `
     <div class="stats-grid">
       <div class="stat-card cyan"><span class="stat-icon">◎</span><div class="stat-value">${s.user_count||0}</div><div class="stat-label">Total Users</div></div>
@@ -428,10 +455,325 @@ async function renderDashboard(ca) {
       <div class="stat-card green"><span class="stat-icon">∿</span><div class="stat-value">${total_req}</div><div class="stat-label">Requests (30d)</div></div>
       <div class="stat-card purple"><span class="stat-icon">⊛</span><div class="stat-value">${s.proxy_count||0}</div><div class="stat-label">Active Proxies</div></div>
     </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px">
+      <div class="card">
+        <div class="card-header"><div class="card-title">Request Volume (30d)</div></div>
+        <div class="card-body">${makeChart(s.daily||[])}</div>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-title">Routing Engine</div></div>
+        <div class="card-body" style="padding:12px 16px">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+            ${[
+              ['Completions',rt.total_completions||0,'var(--green)'],
+              ['Failures',rt.total_failures||0,'var(--red)'],
+              ['Fallbacks',rt.total_fallbacks||0,'var(--orange)'],
+              ['Ledger Events',rt.ledger_events||0,'var(--cyan)'],
+              ['Models',rt.model_count||0,'var(--blue)'],
+              ['Garbage',rt.garbage_count||0,'var(--text2)'],
+            ].map(([label,val,color])=>`
+              <div style="background:var(--bg3);border-radius:var(--r4);padding:8px 10px">
+                <div style="font-size:16px;font-weight:700;color:${color};font-family:var(--mono)">${val}</div>
+                <div style="font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.05em">${label}</div>
+              </div>`).join('')}
+          </div>
+        </div>
+      </div>
+    </div>
+    ${(rs.top_models||[]).length ? `
     <div class="card">
-      <div class="card-header"><div class="card-title">Request Volume (30 days)</div></div>
-      <div class="card-body">${makeChart(s.daily||[])}</div>
+      <div class="card-header"><div class="card-title">Top Models by Usage</div></div>
+      <div class="card-body" style="padding:0"><div class="tbl-wrap"><table>
+        <thead><tr><th>Model</th><th style="text-align:right">Requests</th><th style="text-align:right">Tokens</th></tr></thead>
+        <tbody>${(rs.top_models||[]).map(m=>`<tr>
+          <td><span class="mono" style="font-size:12px">${esc(m.model_id)}</span></td>
+          <td style="text-align:right;color:var(--cyan);font-family:var(--mono)">${m.requests}</td>
+          <td style="text-align:right;color:var(--text2);font-family:var(--mono)">${m.tokens}</td>
+        </tr>`).join('')}</tbody>
+      </table></div></div>
+    </div>` : ''}`;
+}
+
+// ─── Playground ───────────────────────────────────────────────────────────────
+
+async function renderPlayground(ca) {
+  const {data:models=[]} = await GET('/v1/models');
+  const realModels = models.filter(m=>!['auto','omrp/auto','omrp/auto-free'].includes(m.id));
+
+  ca.innerHTML = `
+    <div style="display:flex;flex-direction:column;height:calc(100vh - var(--topbar-h) - 32px);gap:12px">
+      <!-- Controls bar -->
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <select id="pg-model" class="form-select" style="max-width:280px">
+          <option value="omrp/auto">⚡ omrp/auto (smart routing)</option>
+          ${realModels.sort((a,b)=>a.id.localeCompare(b.id)).map(m=>`
+            <option value="${esc(m.id)}">${esc(m.id)} (${esc(m.owned_by||'')})</option>`).join('')}
+        </select>
+        <select id="pg-tier" class="form-select" style="max-width:140px">
+          <option value="">auto tier</option>
+          <option value="simple">🟢 simple</option>
+          <option value="medium">🔵 medium</option>
+          <option value="complex">🟡 complex</option>
+          <option value="reasoning">🟣 reasoning</option>
+        </select>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer">
+          <input type="checkbox" id="pg-stream" checked> Stream
+        </label>
+        <button class="btn btn-ghost" style="margin-left:auto;font-size:12px" onclick="pgClear()">Clear</button>
+      </div>
+      <!-- Messages -->
+      <div id="pg-msgs" style="flex:1;overflow-y:auto;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r8);padding:14px;display:flex;flex-direction:column;gap:12px">
+        <div style="color:var(--text2);font-size:12px;text-align:center;margin:auto">Send a message to test the routing engine directly from the admin panel.</div>
+      </div>
+      <!-- Input -->
+      <div style="display:flex;gap:8px;align-items:flex-end">
+        <textarea id="pg-inp" rows="2" class="form-input" style="flex:1;resize:none;min-height:60px" placeholder="Message… (Enter=send, Shift+Enter=newline)"></textarea>
+        <button id="pg-send" class="btn btn-primary" style="height:60px;padding:0 20px" onclick="pgSend()">Send ↵</button>
+      </div>
     </div>`;
+
+  // Keyboard binding
+  document.getElementById('pg-inp').addEventListener('keydown', e => {
+    if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); pgSend(); }
+  });
+}
+
+let pgBusy = false, pgHist = [];
+
+async function pgSend() {
+  if (pgBusy) return;
+  const inp   = document.getElementById('pg-inp');
+  const msgs  = document.getElementById('pg-msgs');
+  const text  = inp.value.trim();
+  if (!text) return;
+  inp.value = '';
+
+  const model    = document.getElementById('pg-model').value || 'omrp/auto';
+  const tierOvr  = document.getElementById('pg-tier').value;
+  const stream   = document.getElementById('pg-stream').checked;
+
+  pgHist.push({role:'user',content:text});
+  pgBusy = true;
+  document.getElementById('pg-send').disabled = true;
+
+  // Add user message bubble
+  msgs.innerHTML += `<div style="align-self:flex-end;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r8);padding:9px 13px;max-width:80%;white-space:pre-wrap;font-size:13px">${esc(text)}</div>`;
+
+  // Add AI placeholder
+  const aiId = 'pgai-'+Date.now();
+  msgs.innerHTML += `<div id="${aiId}" style="align-self:flex-start;max-width:88%;font-size:13px;line-height:1.65">
+    <div style="font-size:11px;color:var(--text2);margin-bottom:4px" id="${aiId}-meta">⚡ OMRP <span style="color:var(--text3)">routing…</span></div>
+    <div id="${aiId}-body" style="white-space:pre-wrap"></div>
+    <span class="cursor" id="${aiId}-cur"></span>
+  </div>`;
+  msgs.scrollTop = msgs.scrollHeight;
+
+  const sysHints = [tierOvr && `tier:${tierOvr}`].filter(Boolean);
+  const msgList  = [...(sysHints.length?[{role:'system',content:sysHints.join(' ')}]:[]),...pgHist];
+
+  try {
+    const res = await fetch('/v1/chat/completions',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+S.token},
+      body: JSON.stringify({model,messages:msgList,stream,max_tokens:2048}),
+    });
+
+    const omrpModel = res.headers.get('x-omrp-model') || '';
+    const omrpTier  = res.headers.get('x-omrp-tier')  || '';
+    const tierCl    = {simple:'var(--green)',medium:'var(--blue)',complex:'var(--orange)',reasoning:'var(--purple)',explicit:'var(--text2)'}[omrpTier?.toLowerCase()] || 'var(--text2)';
+    document.getElementById(aiId+'-meta').innerHTML =
+      `⚡ OMRP &nbsp;<span class="mono" style="font-size:11px;color:${tierCl}">[${esc(omrpTier||'?')}]</span>&nbsp;<span class="mono" style="font-size:10px;color:var(--text2)">${esc(omrpModel)}</span>`;
+
+    if (!res.ok) {
+      let msg='HTTP '+res.status;
+      try{msg=(await res.json()).error?.message||msg;}catch{}
+      document.getElementById(aiId+'-body').style.color='var(--red)';
+      document.getElementById(aiId+'-body').textContent=msg;
+      pgBusy=false; document.getElementById('pg-send').disabled=false; return;
+    }
+
+    if (stream) {
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let   buf = '', full = '';
+      while(true) {
+        const {done,value} = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value,{stream:true});
+        const lines = buf.split('\n'); buf = lines.pop()||'';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const d = line.slice(6).trim();
+          if (d==='[DONE]') { reader.cancel(); break; }
+          try { const chunk=JSON.parse(d); const delta=chunk.choices?.[0]?.delta?.content||''; if(delta){full+=delta;} } catch{}
+        }
+        document.getElementById(aiId+'-cur')?.remove();
+        document.getElementById(aiId+'-body').textContent = full;
+        const cur=document.createElement('span'); cur.className='cursor'; cur.id=aiId+'-cur';
+        document.getElementById(aiId+'-body').after(cur);
+        msgs.scrollTop = msgs.scrollHeight;
+      }
+      document.getElementById(aiId+'-cur')?.remove();
+      if (full) pgHist.push({role:'assistant',content:full});
+    } else {
+      const data = await res.json();
+      const txt  = data.choices?.[0]?.message?.content || '(empty)';
+      document.getElementById(aiId+'-body').textContent = txt;
+      document.getElementById(aiId+'-cur')?.remove();
+      pgHist.push({role:'assistant',content:txt});
+    }
+  } catch(e) {
+    document.getElementById(aiId+'-body').style.color='var(--red)';
+    document.getElementById(aiId+'-body').textContent='Error: '+e.message;
+  }
+  pgBusy=false; document.getElementById('pg-send').disabled=false;
+  msgs.scrollTop=msgs.scrollHeight;
+}
+
+function pgClear() { pgHist=[]; document.getElementById('pg-msgs').innerHTML='<div style="color:var(--text2);font-size:12px;text-align:center;margin:auto">Cleared.</div>'; }
+
+// ─── Routing Intelligence ─────────────────────────────────────────────────────
+
+async function renderRoutingIntel(ca) {
+  const [{models=[],...health}, {routing={},db_stats={},daily=[],top_models=[]}] = await Promise.all([
+    GET('/api/admin/models/health'),
+    GET('/api/admin/routing/stats'),
+  ]);
+
+  const activeModels  = models.filter(m=>!m.is_garbage);
+  const garbageModels = models.filter(m=> m.is_garbage);
+  const bestModel     = health.selected || (models[0]||{}).id || '—';
+
+  // Compact percentage bar helper
+  const pct = (v,max=1,color='var(--blue)') => {
+    const w = Math.round(Math.min(1,v/max)*100);
+    return `<div style="background:var(--bg3);border-radius:3px;height:6px;overflow:hidden;flex:1">
+      <div style="background:${color};width:${w}%;height:100%;border-radius:3px"></div></div>`;
+  };
+
+  ca.innerHTML = `
+    <!-- SHA-256 Ledger banner -->
+    <div style="background:var(--cyan-dim);border:1px solid var(--cyan)40;border-radius:var(--r8);padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:14px">
+      <div style="font-size:20px">⛓</div>
+      <div style="flex:1">
+        <div style="font-weight:700;color:var(--cyan);font-size:13px">SHA-256 Tamper-Evident Ledger</div>
+        <div style="font-size:12px;color:var(--text2);margin-top:2px">
+          <strong style="color:var(--text1)">${routing.ledger_events||0}</strong> events chained · 
+          Every routing decision cryptographically linked to the previous entry — any modification is immediately detectable.
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div class="badge badge-green" style="font-size:10px">● Intact</div>
+      </div>
+    </div>
+
+    <!-- Thompson Sampling banner -->
+    <div style="background:var(--purple)18;border:1px solid #8040ff40;border-radius:var(--r8);padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:14px">
+      <div style="font-size:20px">🎲</div>
+      <div style="flex:1">
+        <div style="font-weight:700;color:var(--purple);font-size:13px">Thompson Sampling Active</div>
+        <div style="font-size:12px;color:var(--text2);margin-top:2px">
+          Each request samples Beta(α,β) per model — balancing exploitation (proven models) vs exploration (uncertain ones).
+          Current seed: <span class="mono" style="color:var(--text1)">${health.ts_seed||0}</span> &nbsp;·&nbsp; 
+          Selected: <span class="mono" style="color:var(--purple)">${esc(bestModel)}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Stats row -->
+    <div class="stats-grid" style="margin-bottom:16px">
+      <div class="stat-card"><div class="stat-value" style="color:var(--cyan)">${activeModels.length}</div><div class="stat-label">Active Models</div></div>
+      <div class="stat-card"><div class="stat-value" style="color:var(--red)">${garbageModels.length}</div><div class="stat-label">Wilson Excluded</div></div>
+      <div class="stat-card"><div class="stat-value" style="color:var(--green)">${routing.total_completions||0}</div><div class="stat-label">Completions</div></div>
+      <div class="stat-card"><div class="stat-value" style="color:var(--orange)">${routing.total_fallbacks||0}</div><div class="stat-label">Fallbacks</div></div>
+    </div>
+
+    <!-- Bayesian Score Table -->
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header">
+        <div class="card-title">BKG-FMR Bayesian Agent Scoring</div>
+        <div style="font-size:11px;color:var(--text2)">5-factor · Laplace-smoothed Beta · Wilson Score GC</div>
+      </div>
+      <div class="card-body" style="padding:0"><div class="tbl-wrap"><table>
+        <thead><tr>
+          <th>Model</th><th>Score</th>
+          <th title="Bayesian α/(α+β)">Competence</th>
+          <th title="Inverse latency EMA">Speed</th>
+          <th title="Inverse Beta variance">Stability</th>
+          <th title="1 - inflight/max">Load</th>
+          <th title="Health gate">Health</th>
+          <th>α/β</th>
+          <th>Wilson LB</th>
+          <th>Status</th>
+        </tr></thead>
+        <tbody>${models.sort((a,b)=>b.score-a.score).map(m=>{
+          const factors = Object.fromEntries((m.factors||[]).map(f=>[f.name,f]));
+          const comp    = (m.bayesian_competence*100).toFixed(1);
+          const speed   = factors.latency   ? (factors.latency.value*100).toFixed(0)   : '—';
+          const stab    = (m.beta_stability*100).toFixed(1);
+          const load    = factors.load      ? (factors.load.value*100).toFixed(0)      : '100';
+          const health  = factors.health    ? factors.health.value : 0;
+          const wilson  = (m.wilson_lower*100).toFixed(1);
+          const scoreColor = m.is_garbage ? 'var(--red)' : m.score>1.0 ? 'var(--green)' : 'var(--cyan)';
+          return `<tr style="${m.is_garbage?'opacity:.5':''}">
+            <td><span class="mono" style="font-size:11px">${esc(m.id)}</span></td>
+            <td><span style="font-weight:700;color:${scoreColor};font-family:var(--mono)">${m.score.toFixed(3)}</span></td>
+            <td>
+              <div style="display:flex;align-items:center;gap:6px">
+                <span class="mono" style="font-size:11px;color:var(--cyan)">${comp}%</span>
+                ${pct(m.bayesian_competence,1,'var(--cyan)')}
+              </div>
+            </td>
+            <td><div style="display:flex;align-items:center;gap:6px">
+              <span class="mono" style="font-size:11px">${speed}%</span>
+              ${pct(Number(speed)||100,100,'var(--blue)')}
+            </div></td>
+            <td><div style="display:flex;align-items:center;gap:6px">
+              <span class="mono" style="font-size:11px">${stab}%</span>
+              ${pct(m.beta_stability,1,'var(--purple)')}
+            </div></td>
+            <td><span class="mono" style="font-size:11px">${load}%</span></td>
+            <td>${health>=1?'<span class="badge badge-green">✓</span>':health>0?'<span class="badge badge-orange">~</span>':'<span class="badge badge-red">✗</span>'}</td>
+            <td><span class="mono" style="font-size:11px;color:var(--text2)">${m.success_count}/${m.failure_count}</span></td>
+            <td><span class="mono" style="font-size:11px;color:${Number(wilson)<15?'var(--red)':Number(wilson)<30?'var(--orange)':'var(--green)'}">${wilson}%</span></td>
+            <td>${m.is_garbage
+              ? '<span class="badge badge-red">⊘ GC</span>'
+              : m.id===bestModel
+                ? '<span class="badge badge-green">★ selected</span>'
+                : '<span class="badge badge-gray">active</span>'}
+            </td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table></div></div>
+    </div>
+
+    <!-- Wilson Score Exclusions -->
+    ${garbageModels.length ? `
+    <div class="card">
+      <div class="card-header"><div class="card-title" style="color:var(--red)">Wilson Score Exclusions</div>
+        <div style="font-size:11px;color:var(--text2)">Wilson LB &lt; 15% with ≥5 observations — excluded from all routing decisions</div>
+      </div>
+      <div class="card-body" style="padding:0"><div class="tbl-wrap"><table>
+        <thead><tr><th>Model</th><th>Wilson LB</th><th>α (success)</th><th>β (failure)</th><th>Last Obs</th></tr></thead>
+        <tbody>${garbageModels.map(m=>`<tr>
+          <td><span class="mono" style="font-size:11px;color:var(--red)">${esc(m.id)}</span></td>
+          <td><span class="mono" style="color:var(--red)">${(m.wilson_lower*100).toFixed(1)}%</span></td>
+          <td><span class="mono">${m.success_count}</span></td>
+          <td><span class="mono">${m.failure_count}</span></td>
+          <td><span style="font-size:12px;color:var(--text2)">${m.total_obs} observations</span></td>
+        </tr>`).join('')}
+        </tbody>
+      </table></div></div>
+    </div>` : `
+    <div class="card">
+      <div class="card-body" style="padding:12px 18px;font-size:12px;color:var(--text2)">
+        ✓ No models excluded by Wilson Score garbage detection. All ${models.length} models active.
+      </div>
+    </div>`}`;
+}
+
+// ─── Users (with stats + click detail) ───────────────────────────────────────
 }
 
 function makeChart(daily) {

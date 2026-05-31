@@ -33,7 +33,7 @@ use crate::auth::{
     sha256_hex, AppState, AuthUser, LoginRequest, MaybeAuthUser,
 };
 use crate::config::Config;
-use crate::db::{ApiKeyRow, Database, ProviderKeyRow, UserRow};
+use crate::db::{ApiKeyPermissions, ApiKeyRow, Database, ProviderKeyRow, UserRow};
 use crate::provider::CompatClient;
 use crate::routing::{bootstrap_pipeline, select_for_tier, tier_from_str, tier_model_ids};
 use omrp_core::classifier::{classify_prompt, detect_mode_override};
@@ -89,6 +89,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/routing/stats",  get(admin_routing_stats))
         // ── Admin: per-user stats ─────────────────────────────────────────────
         .route("/api/admin/users/:id/stats", get(admin_user_stats))
+        // ── Admin: per-user API key + permissions ─────────────────────────────
+        .route("/api/admin/users/:id/key",             get(admin_get_user_key))
+        .route("/api/admin/users/:id/key/permissions", put(admin_update_user_key_permissions))
+        // ── Admin: proxy usage stats ──────────────────────────────────────────
+        .route("/api/admin/proxies/stats", get(admin_proxy_stats))
+        // ── User: own key + permissions ────────────────────────────────────────
+        .route("/api/user/key",         get(user_get_key))
+        .route("/api/user/permissions", get(user_get_permissions))
         // ── User: personal API keys ────────────────────────────────────────────
         .route("/api/user/api-keys",     get(user_list_api_keys).post(user_create_api_key))
         .route("/api/user/api-keys/:id", delete(user_revoke_api_key))
@@ -306,8 +314,18 @@ async fn setup_init(
     if let Some(name) = req.app_name {
         let _ = state.db.set_setting("app.name", &name, ts);
     }
+    // Auto-generate admin's single API key with full permissions (proxy bypass enabled)
+    let admin_key = match state.db.create_user_api_key(&uid, "admin-default", &ApiKeyPermissions::admin_default()) {
+        Ok((_, raw)) => raw,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Key gen failed: {e}")),
+    };
     let _ = state.db.audit(Some(&uid), "setup.init", Some(&uid), Some("user"), None, None, ts);
-    ok(json!({ "status": "ok", "user_id": uid, "message": "Admin account created. Please log in." }))
+    ok(json!({
+        "status":   "ok",
+        "user_id":  uid,
+        "api_key":  admin_key,
+        "message":  "Admin account created. Save your API key — it will not be shown again.",
+    }))
 }
 
 // ─── Admin: users ─────────────────────────────────────────────────────────────
@@ -369,8 +387,25 @@ async fn admin_create_user(
     }
     let role = if row.is_admin { "role_admin" } else { "role_user" };
     let _ = state.db.assign_role(&uid, role);
+
+    // Auto-generate the user's single API key
+    let default_perms = if row.is_admin {
+        ApiKeyPermissions::admin_default()
+    } else {
+        ApiKeyPermissions::default()
+    };
+    let user_key = match state.db.create_user_api_key(&uid, "account-default", &default_perms) {
+        Ok((_, raw)) => raw,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Key gen failed: {e}")),
+    };
+
     let _ = state.db.audit(Some(&user.user_id), "user.create", Some(&uid), Some("user"), None, None, ts);
-    (StatusCode::CREATED, Json(json!({ "id": uid, "username": row.username }))).into_response()
+    (StatusCode::CREATED, Json(json!({
+        "id":      uid,
+        "username": row.username,
+        "api_key": user_key,
+        "note":    "Share this key with the user — it will not be shown again.",
+    }))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -485,11 +520,12 @@ async fn admin_create_api_key(
         user_id:    req.user_id,
         key_hash:   hash,
         key_prefix: prefix,
-        label:      req.label.unwrap_or_else(|| "default".into()),
-        is_active:  true,
-        created_at: ts,
-        last_used:  None,
-        expires_at: None,
+        label:       req.label.unwrap_or_else(|| "default".into()),
+        is_active:   true,
+        created_at:  ts,
+        last_used:   None,
+        expires_at:  None,
+        permissions: "{}".into(),
     };
     if let Err(e) = state.db.insert_api_key(&row) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e);
@@ -861,6 +897,112 @@ async fn admin_user_stats(
     }))
 }
 
+// ─── Admin: per-user key management ──────────────────────────────────────────
+
+async fn admin_get_user_key(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Path(uid): Path<String>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    match state.db.get_user_api_key(&uid) {
+        Ok(Some(k)) => ok(json!(serialize_api_key(&k))),
+        Ok(None)    => err(StatusCode::NOT_FOUND, "No active API key for this user"),
+        Err(e)      => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdatePermissionsRequest {
+    can_use_router:       Option<bool>,
+    can_use_proxy_bypass: Option<bool>,
+    allowed_models:       Option<Vec<String>>,
+    rate_limit_per_hour:  Option<u32>,
+}
+
+async fn admin_update_user_key_permissions(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Path(uid): Path<String>,
+    Json(req): Json<UpdatePermissionsRequest>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    let key = match state.db.get_user_api_key(&uid) {
+        Ok(Some(k)) => k,
+        Ok(None)    => return err(StatusCode::NOT_FOUND, "No API key for this user"),
+        Err(e)      => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let mut perms = ApiKeyPermissions::from_json(&key.permissions);
+    if let Some(v) = req.can_use_router       { perms.can_use_router = v; }
+    if let Some(v) = req.can_use_proxy_bypass { perms.can_use_proxy_bypass = v; }
+    if let Some(v) = req.allowed_models       { perms.allowed_models = v; }
+    if let Some(v) = req.rate_limit_per_hour  { perms.rate_limit_per_hour = v; }
+    let ts = now_secs() as i64;
+    match state.db.update_api_key_permissions(&key.id, &perms) {
+        Ok(_) => {
+            let _ = state.db.audit(
+                Some(&user.user_id), "api_key.permissions_update",
+                Some(&key.id), Some("api_key"),
+                Some(&perms.to_json()), None, ts,
+            );
+            ok(json!({ "status": "ok", "key_id": key.id, "permissions": perms }))
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn admin_proxy_stats(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+    let stats = state.db.proxy_usage_stats().unwrap_or_default();
+    let recent_1h  = state.db.proxy_requests_recent(1).unwrap_or(0);
+    let recent_24h = state.db.proxy_requests_recent(24).unwrap_or(0);
+    let pool_size  = state.proxy_pool.len();
+    ok(json!({
+        "pool_size":   pool_size,
+        "requests_1h":  recent_1h,
+        "requests_24h": recent_24h,
+        "proxies": stats.iter().map(|(url, total, ok_c, users, last)| json!({
+            "url":       url,
+            "total":     total,
+            "ok":        ok_c,
+            "err":       total - ok_c,
+            "success_pct": if *total > 0 { (ok_c * 100 / total) } else { 100 },
+            "users":     users,
+            "last_used": last,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+// ─── User: own key + permissions ─────────────────────────────────────────────
+
+async fn user_get_key(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+) -> Response {
+    match state.db.get_user_api_key(&user.user_id) {
+        Ok(Some(k)) => ok(json!({
+            "id":          k.id,
+            "key_prefix":  k.key_prefix,
+            "label":       k.label,
+            "is_active":   k.is_active,
+            "created_at":  k.created_at,
+            "last_used":   k.last_used,
+            "permissions": ApiKeyPermissions::from_json(&k.permissions),
+        })),
+        Ok(None) => err(StatusCode::NOT_FOUND, "No active API key — contact your admin"),
+        Err(e)   => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn user_get_permissions(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+) -> Response {
+    match state.db.get_user_api_key(&user.user_id) {
+        Ok(Some(k)) => ok(json!(ApiKeyPermissions::from_json(&k.permissions))),
+        Ok(None)    => ok(json!(ApiKeyPermissions::default())),
+        Err(e)      => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 // ─── User: personal API keys ──────────────────────────────────────────────────
 
 async fn user_list_api_keys(
@@ -881,13 +1023,14 @@ async fn user_create_api_key(
     let prefix  = raw_key.chars().take(16).collect::<String>();
     let ts = now_secs() as i64;
     let row = ApiKeyRow {
-        id:         generate_key_id(),
-        user_id:    Some(user.user_id.clone()),
-        key_hash:   hash,
-        key_prefix: prefix,
-        label:      req.label.unwrap_or_else(|| "default".into()),
-        is_active:  true,
-        created_at: ts, last_used: None, expires_at: None,
+        id:          generate_key_id(),
+        user_id:     Some(user.user_id.clone()),
+        key_hash:    hash,
+        key_prefix:  prefix,
+        label:       req.label.unwrap_or_else(|| "default".into()),
+        is_active:   true,
+        created_at:  ts, last_used: None, expires_at: None,
+        permissions: "{}".into(),
     };
     if let Err(e) = state.db.insert_api_key(&row) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e);
@@ -1022,15 +1165,48 @@ async fn proxy_completions(
     maybe_user: MaybeAuthUser,
     req: Request<Body>,
 ) -> Response {
-    // ── Auth check (if any keys are configured) ───────────────────────────────
-    // (auth is checked in FromRequestParts for MaybeAuthUser; if keys exist
-    //  and the request has no valid token, we reject it here)
+    // ── Auth + permission check ────────────────────────────────────────────────
+    // If any API keys exist in the DB, the request MUST carry a valid token.
+    // We also extract the caller's permissions for model-allow-listing and
+    // proxy-bypass decisions.
     let key_count = state.db.list_all_api_keys()
         .map(|k| k.iter().filter(|k| k.is_active).count())
         .unwrap_or(0);
     if key_count > 0 && maybe_user.0.is_none() {
         return err(StatusCode::UNAUTHORIZED, "Bearer token required");
     }
+
+    // Resolve caller's API key permissions
+    let caller_perms: ApiKeyPermissions = if let Some(ref u) = maybe_user.0 {
+        match u.api_key_id.as_deref() {
+            Some(kid) => {
+                // Find by key ID to get permissions
+                match state.db.get_user_api_key(&u.user_id) {
+                    Ok(Some(k)) => ApiKeyPermissions::from_json(&k.permissions),
+                    _ => ApiKeyPermissions::default(),
+                }
+            }
+            None => {
+                // JWT session — look up their API key's permissions
+                match state.db.get_user_api_key(&u.user_id) {
+                    Ok(Some(k)) => ApiKeyPermissions::from_json(&k.permissions),
+                    _ => ApiKeyPermissions::admin_default(), // JWT-only session = full access
+                }
+            }
+        }
+    } else {
+        ApiKeyPermissions::admin_default() // No auth configured = open access
+    };
+
+    // Check router permission
+    if !caller_perms.can_use_router {
+        return err(StatusCode::FORBIDDEN, "Router access not permitted by your API key");
+    }
+
+    let caller_key_id = maybe_user.0.as_ref().and_then(|u| u.api_key_id.clone())
+        .or_else(|| maybe_user.0.as_ref().and_then(|u| {
+            state.db.get_user_api_key(&u.user_id).ok()?.map(|k| k.id)
+        }));
 
     // ── Parse request body ────────────────────────────────────────────────────
     let body_bytes = match axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await {
@@ -1081,6 +1257,14 @@ async fn proxy_completions(
         return err(StatusCode::SERVICE_UNAVAILABLE, "No models available");
     }
 
+    // Check allowed_models permission
+    if !caller_perms.allowed_models.is_empty()
+        && !caller_perms.allowed_models.iter().any(|m| m == &routed_model || m == "*")
+    {
+        return err(StatusCode::FORBIDDEN,
+            format!("Model '{}' not permitted by your API key", routed_model));
+    }
+
     // ── Find provider name ────────────────────────────────────────────────────
     let prov_name = cfg.model.iter()
         .find(|m| m.id == routed_model)
@@ -1093,12 +1277,15 @@ async fn proxy_completions(
         .resolve_provider_key(&prov_name, if user_id.is_empty() { None } else { Some(&user_id) })
         .unwrap_or(None);
 
-    let routed = routed_model.clone();
-    let prov      = prov_name.clone();
-    let tier_out  = tier_str.clone();
-    let db2       = state.db.clone();
-    let uid_opt   = maybe_user.0.as_ref().map(|u| u.user_id.clone());
-    let pool      = state.proxy_pool.clone();
+    let routed       = routed_model.clone();
+    let prov         = prov_name.clone();
+    let tier_out     = tier_str.clone();
+    let db2          = state.db.clone();
+    let uid_opt      = maybe_user.0.as_ref().map(|u| u.user_id.clone());
+    let pool         = state.proxy_pool.clone();
+    let use_bypass   = caller_perms.can_use_proxy_bypass && !pool.is_empty()
+        && state.db.get_setting("proxy.enabled").ok().flatten().map(|v| v=="1").unwrap_or(false);
+    let the_key_id   = caller_key_id.clone();
 
     // Resolve the API key string once, before entering spawn_blocking.
     // This lets us rebuild CompatClient for every proxy retry without
@@ -1135,18 +1322,20 @@ async fn proxy_completions(
             }
         }).collect();
 
-        let proxy_available = !pool.is_empty();
-        // Attempt 0 = direct; 1..=MAX = via proxy
-        let total_attempts = if proxy_available {
-            1 + MAX_PROXY_ATTEMPTS.min(pool.len())
+        let proxy_available = use_bypass && !pool.is_empty();
+        // When bypass is ON: start at proxy[0] immediately (no direct attempt).
+        // When bypass is OFF: only attempt 0 (direct), no proxy fallback.
+        let (start_attempt, total_attempts) = if proxy_available {
+            (1usize, 1 + MAX_PROXY_ATTEMPTS.min(pool.len())) // skip direct (attempt 0)
         } else {
-            1
+            (0usize, 1) // direct only
         };
 
         let mut last_err   = String::from("no attempt made");
-        let mut proxy_used = 0i64; // DB id of the proxy used in current attempt
+        let mut proxy_used = 0i64;
+        let mut proxy_url_used: Option<String> = None;
 
-        for attempt in 0..total_attempts {
+        for attempt in start_attempt..total_attempts {
             // ── Build client for this attempt ─────────────────────────────────
             let client = if api_key_str.is_empty() {
                 match CompatClient::for_provider(&prov) {
@@ -1160,18 +1349,21 @@ async fn proxy_completions(
                 }
             };
 
-            // Attach proxy for attempts 1+
-            let client = if attempt > 0 {
-                match pool.nth(attempt - 1) {
+            // Attach proxy (always for bypass mode; only for attempt>0 in fallback mode)
+            let client = if attempt > 0 || proxy_available {
+                let proxy_idx = if proxy_available { attempt - 1 } else { attempt };
+                match pool.nth(proxy_idx) {
                     Some(ref p) => {
-                        proxy_used = p.id;
-                        eprintln!("[proxy] attempt {attempt}: {}", p.url);
+                        proxy_used    = p.id;
+                        proxy_url_used = Some(p.url.clone());
+                        eprintln!("[proxy] {} via {}", &routed[..routed.len().min(30)], p.url);
                         client.with_proxy(&p.url)
                     }
                     None => break, // pool exhausted
                 }
             } else {
-                proxy_used = 0;
+                proxy_used    = 0;
+                proxy_url_used = None;
                 client
             };
 
@@ -1182,11 +1374,9 @@ async fn proxy_completions(
 
             match res {
                 Ok(cr) => {
-                    // Success — advance pool cursor so the next request doesn't
-                    // re-use the same proxy batch that hit rate limits.
-                    if attempt > 0 {
+                    if proxy_used > 0 {
                         pool.mark_success(proxy_used, &db2);
-                        pool.advance(attempt);
+                        pool.advance(if proxy_available { attempt } else { attempt });
                     }
                     let _ = db2.log_request(
                         uid_opt.as_deref(), None,
@@ -1194,16 +1384,26 @@ async fn proxy_completions(
                         0, cr.tokens_used as i64, latency, true, None,
                         now_secs() as i64,
                     );
+                    // Log proxy usage
+                    if proxy_used > 0 || proxy_available {
+                        let _ = db2.log_proxy_request(
+                            if proxy_used > 0 { Some(proxy_used) } else { None },
+                            proxy_url_used.as_deref(),
+                            &routed, &prov,
+                            uid_opt.as_deref(),
+                            the_key_id.as_deref(),
+                            true, latency,
+                            now_secs() as i64,
+                        );
+                    }
                     return Ok(cr);
                 }
 
                 Err(ProviderError::RateLimited { .. }) => {
-                    // 429 — this IP is rate-limited.  Don't mark the proxy as
-                    // failed (it works, just not for us right now).  Move on.
-                    if attempt > 0 {
+                    if proxy_used > 0 {
                         eprintln!("[proxy] 429 on proxy id={proxy_used}, trying next");
                     } else {
-                        eprintln!("[proxy] 429 on direct, trying proxy pool");
+                        eprintln!("[proxy] 429 on direct");
                     }
                     last_err = "rate_limited".into();
                     // continue to next attempt
@@ -1299,14 +1499,15 @@ async fn server_stats(State(state): State<Arc<AppState>>) -> Response {
 
 fn serialize_api_key(k: &ApiKeyRow) -> Value {
     json!({
-        "id":         k.id,
-        "user_id":    k.user_id,
-        "key_prefix": k.key_prefix,
-        "label":      k.label,
-        "is_active":  k.is_active,
-        "created_at": k.created_at,
-        "last_used":  k.last_used,
-        "expires_at": k.expires_at,
+        "id":          k.id,
+        "user_id":     k.user_id,
+        "key_prefix":  k.key_prefix,
+        "label":       k.label,
+        "is_active":   k.is_active,
+        "created_at":  k.created_at,
+        "last_used":   k.last_used,
+        "expires_at":  k.expires_at,
+        "permissions": ApiKeyPermissions::from_json(&k.permissions),
     })
 }
 
