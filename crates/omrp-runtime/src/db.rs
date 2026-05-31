@@ -1068,6 +1068,29 @@ impl Database {
             params![since], |r| r.get(0),
         )
     }
+
+    /// Count requests made by a user (or by a specific API key) in the last hour.
+    /// Used to enforce `rate_limit_per_hour` API key permissions.
+    ///
+    /// Checks `request_logs` for matching user_id OR api_key_id entries
+    /// created within the last 3600 seconds.
+    pub fn requests_last_hour(
+        &self, user_id: Option<&str>, api_key_id: Option<&str>,
+    ) -> SqlResult<i64> {
+        let since = now_secs() - 3600;
+        let conn  = self.conn.lock().unwrap();
+        match (user_id, api_key_id) {
+            (_, Some(kid)) => conn.query_row(
+                "SELECT COUNT(*) FROM request_logs WHERE api_key_id=?1 AND created_at >= ?2",
+                params![kid, since], |r| r.get(0),
+            ),
+            (Some(uid), None) => conn.query_row(
+                "SELECT COUNT(*) FROM request_logs WHERE user_id=?1 AND created_at >= ?2",
+                params![uid, since], |r| r.get(0),
+            ),
+            (None, None) => Ok(0),
+        }
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

@@ -1260,10 +1260,30 @@ async fn proxy_completions(
         return err(StatusCode::FORBIDDEN, "Router access not permitted by your API key");
     }
 
+    // Resolve caller key ID (needed for rate-limit check and request logging)
     let caller_key_id = maybe_user.0.as_ref().and_then(|u| u.api_key_id.clone())
         .or_else(|| maybe_user.0.as_ref().and_then(|u| {
             state.db.get_user_api_key(&u.user_id).ok()?.map(|k| k.id)
         }));
+
+    // Enforce rate_limit_per_hour (0 = unlimited)
+    if caller_perms.rate_limit_per_hour > 0 {
+        let uid   = maybe_user.0.as_ref().map(|u| u.user_id.as_str());
+        let kid   = caller_key_id.as_deref();
+        let count = state.db.requests_last_hour(uid, kid).unwrap_or(0);
+        if count >= caller_perms.rate_limit_per_hour as i64 {
+            let mut hdrs = HeaderMap::new();
+            if let Ok(v) = "60".parse() { hdrs.insert("Retry-After", v); }
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                hdrs,
+                Json(json!({ "error": { "message":
+                    format!("Rate limit exceeded: {} req/hr. Retry after window resets.",
+                        caller_perms.rate_limit_per_hour),
+                    "type": "rate_limit_exceeded", "code": 429 }})),
+            ).into_response();
+        }
+    }
 
     // ── Parse request body ────────────────────────────────────────────────────
     let body_bytes = match axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await {
