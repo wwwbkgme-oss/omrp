@@ -566,11 +566,13 @@ const ADMIN_PAGES = [
   { id:'proxies',    icon:'⊛', label:'Proxies'           },
   { id:'models',     icon:'◉', label:'Models'            },
   { id:'news',       icon:'📣', label:'Announcements'    },
+  { id:'freeway',    icon:'🆓', label:'Free Providers'   },
 ];
 const USER_PAGES = [
   { id:'playground', icon:'⚡', label:'Playground'      },
   { id:'my-keys',    icon:'⌗', label:'My API Key'     },
   { id:'my-pkeys',   icon:'⊟', label:'My Providers'   },
+  { id:'freeway',    icon:'🆓', label:'Free Providers' },
   { id:'my-stats',   icon:'∿', label:'Usage'           },
   { id:'my-profile', icon:'◎', label:'Profile'         },
 ];
@@ -630,6 +632,7 @@ async function render(page) {
       case 'proxies':    await renderProxies(ca); break;
       case 'models':     await renderModels(ca); break;
       case 'news':       await renderAdminNews(ca); break;
+      case 'freeway':    await renderFreeProviders(ca); break;
       case 'my-keys':    await renderMyKeys(ca); break;
       case 'my-pkeys':   await renderMyProviders(ca); break;
       case 'my-stats':   await renderMyStats(ca); break;
@@ -1957,6 +1960,198 @@ async function renderModels(ca) {
 // ═══════════════════════════════════════════════════════════════════
 //  USER PAGES
 // ═══════════════════════════════════════════════════════════════════
+
+
+// ─── Free Providers discovery page ───────────────────────────────────────────
+
+let _fwFilter = '', _fwHideConfigured = false;
+let _fwProviders = [], _fwConfigured = new Set();
+
+async function renderFreeProviders(ca) {
+  const [{data:providers=[]}, {data:myKeys=[]}] = await Promise.all([
+    GET('/api/public/providers'),
+    GET('/api/user/provider-keys').catch(()=>({data:[]})),
+  ]);
+  _fwProviders    = providers;
+  _fwConfigured   = new Set(myKeys.map(k=>k.provider));
+  _fwFilter       = '';
+  _fwHideConfigured = false;
+
+  if (!document.getElementById('fw-style')) {
+    const s = document.createElement('style'); s.id='fw-style';
+    s.textContent = `
+      .fw-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r8);
+        display:flex;flex-direction:column;cursor:pointer;
+        transition:border-color var(--transition),transform var(--transition),box-shadow var(--transition)}
+      .fw-card:hover{border-color:var(--cyan)40;transform:translateY(-2px);box-shadow:0 6px 24px #00000055}
+      .fw-card-top{padding:14px 16px 10px;flex:1}
+      .fw-card-bot{padding:10px 16px 14px;border-top:1px solid var(--border)66}`;
+    document.head.appendChild(s);
+  }
+
+  ca.innerHTML = `
+    <div class="section-header" style="margin-bottom:14px">
+      <div>
+        <div class="section-title">Free LLM API Providers</div>
+        <div class="section-sub">OpenAI-compatible APIs with free tiers — click a card for models and quick-add</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
+      <input id="fw-q" class="form-input" placeholder="Search…"
+        style="max-width:240px;padding:5px 10px;font-size:12px"
+        oninput="_fwFilter=this.value;_fwRender()">
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text2);cursor:pointer">
+        <input type="checkbox" onchange="_fwHideConfigured=this.checked;_fwRender()"> Hide added
+      </label>
+      <span id="fw-cnt" style="font-size:12px;color:var(--text2);margin-left:auto"></span>
+    </div>
+    <div id="fw-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(265px,1fr));gap:12px"></div>
+    <div id="fw-detail" style="display:none;margin-top:14px"></div>`;
+  _fwRender();
+}
+
+function _fwRender() {
+  const q = _fwFilter.toLowerCase();
+  const list = _fwProviders.filter(p => {
+    if (_fwHideConfigured && _fwConfigured.has(p.id)) return false;
+    return !q || p.name.toLowerCase().includes(q) || p.free_note.toLowerCase().includes(q)
+              || (p.models||[]).some(m=>m.description.toLowerCase().includes(q));
+  });
+  const grid = document.getElementById('fw-grid');
+  if (!grid) return;
+  const cnt = document.getElementById('fw-cnt');
+  if (cnt) cnt.textContent = `${list.length} / ${_fwProviders.length}`;
+
+  grid.innerHTML = list.length ? list.map(p => {
+    const conf = _fwConfigured.has(p.id);
+    const top  = p.models?.[0];
+    return `<div class="fw-card" onclick="_fwDetail('${p.id}')">
+      <div class="fw-card-top">
+        <div style="display:flex;align-items:flex-start;gap:9px">
+          <span style="font-size:20px">${p.country}</span>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:700;color:var(--text0);
+              overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name)}</div>
+            <div style="font-size:10px;color:var(--text3);font-family:var(--mono)">${esc(p.key_env)}</div>
+          </div>
+          ${conf?'<span style="font-size:9px;padding:2px 6px;border-radius:8px;background:var(--green)22;color:var(--green);font-weight:700;white-space:nowrap">✓ added</span>':''}
+        </div>
+        <div style="font-size:11px;color:var(--text1);margin-top:7px;line-height:1.5">${esc(p.free_note)}</div>
+      </div>
+      <div class="fw-card-bot">
+        <div style="font-size:10px;color:var(--text2);margin-bottom:6px">
+          ${(p.models||[]).length} model${(p.models||[]).length!==1?'s':''}
+          ${top?' · '+top.context_k+'K ctx':''}
+        </div>
+        <div style="display:flex;gap:6px">
+          <a href="${esc(p.signup_url)}" target="_blank" rel="noopener"
+            class="btn btn-ghost" style="font-size:11px;padding:3px 8px;text-decoration:none"
+            onclick="event.stopPropagation()">Get key ↗</a>
+          ${conf
+            ? `<button class="btn btn-ghost" style="font-size:11px;padding:3px 8px;color:var(--cyan)"
+                onclick="event.stopPropagation();_fwDetail('${p.id}')">Models</button>`
+            : `<button class="btn btn-primary" style="font-size:11px;padding:3px 8px"
+                onclick="event.stopPropagation();_fwAddKey('${p.id}')">+ Add to OMRP</button>`}
+        </div>
+      </div>
+    </div>`;
+  }).join('')
+  : `<div style="grid-column:1/-1;text-align:center;padding:48px;color:var(--text2)">No results for "${esc(_fwFilter)}"</div>`;
+}
+
+function _fwDetail(id) {
+  const p = _fwProviders.find(x=>x.id===id); if (!p) return;
+  const d = document.getElementById('fw-detail'); if (!d) return;
+  const conf = _fwConfigured.has(p.id);
+  d.style.display='block';
+  d.scrollIntoView({behavior:'smooth',block:'nearest'});
+  d.innerHTML = `<div class="card">
+    <div class="card-header" style="justify-content:space-between">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:18px">${p.country}</span>
+        <span class="card-title">${esc(p.name)}</span>
+        ${conf?'<span class="badge badge-green">configured</span>':''}
+      </div>
+      <button class="btn btn-ghost" style="padding:2px 8px;font-size:12px" onclick="document.getElementById('fw-detail').style.display='none'">✕</button>
+    </div>
+    <div class="card-body">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+        <div>
+          <div class="form-label">Base URL</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--cyan);word-break:break-all;margin-top:2px">${esc(p.base_url)}</div>
+        </div>
+        <div>
+          <div class="form-label">Free tier</div>
+          <div style="font-size:12px;color:var(--text1);margin-top:2px">${esc(p.free_note)}</div>
+        </div>
+      </div>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Model ID</th><th style="width:60px">Ctx</th><th>Description</th><th style="width:130px"></th></tr></thead>
+        <tbody>${(p.models||[]).map(m=>`<tr>
+          <td><span class="mono" style="font-size:11px">${esc(m.id)}</span></td>
+          <td style="text-align:right;font-size:11px;color:var(--text2)">${m.context_k}K</td>
+          <td style="font-size:12px">${esc(m.description)}</td>
+          <td>
+            <button class="btn btn-ghost" style="font-size:11px;padding:2px 7px"
+              onclick="_fwTryModel('${esc(m.id).replace(/'/g,"\\'")}')">Try in playground</button>
+          </td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+      <div style="margin-top:12px;display:flex;gap:8px">
+        <a href="${esc(p.signup_url)}" target="_blank" rel="noopener"
+          class="btn btn-secondary" style="font-size:12px;text-decoration:none">Get free key ↗</a>
+        ${conf?'':
+          `<button class="btn btn-primary" style="font-size:12px" onclick="_fwAddKey('${p.id}')">+ Add to OMRP</button>`}
+      </div>
+    </div>
+  </div>`;
+}
+
+function _fwAddKey(id) {
+  const p = _fwProviders.find(x=>x.id===id); if (!p) return;
+  const knownBuiltin = ['openrouter','groq','cerebras','kilo','buw'];
+  openModal(`
+    <div class="modal-title">Add ${esc(p.name)}</div>
+    <div style="margin-bottom:10px;font-size:12px;color:var(--text2)">
+      Get a free key at <a href="${esc(p.signup_url)}" target="_blank" rel="noopener" style="color:var(--cyan)">${esc(p.signup_url)} ↗</a>
+    </div>
+    <div class="form-group"><label class="form-label">API Key</label>
+      <input id="fwk-val" class="form-input" placeholder="${esc(p.key_env)}" autocomplete="off"></div>
+    <div class="form-group"><label class="form-label">Label</label>
+      <input id="fwk-lbl" class="form-input" value="${esc(p.name)}"></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="_fwSave('${id}',${!knownBuiltin.includes(id)})">Save</button>
+    </div>`);
+}
+
+async function _fwSave(id, isCustom) {
+  const p   = _fwProviders.find(x=>x.id===id); if (!p) return;
+  const val = document.getElementById('fwk-val').value.trim();
+  const lbl = document.getElementById('fwk-lbl').value.trim();
+  if (!val) { toast('Key value required','err'); return; }
+  const body = {
+    provider: id, key_value: val, label: lbl||id,
+    base_url: isCustom ? p.base_url : undefined,
+    display_name: isCustom ? p.name : undefined,
+  };
+  const r = await POST('/api/user/provider-keys', body);
+  if (r.error) { toast(r.error.message,'err'); return; }
+  closeModal();
+  _fwConfigured.add(id);
+  _fwRender();
+  toast(`${lbl||id} key saved — refresh playground to see models`);
+}
+
+function _fwTryModel(modelId) {
+  nav('playground');
+  setTimeout(()=>{
+    const sel = document.getElementById('pg-model'); if (!sel) return;
+    let opt = [...sel.options].find(o=>o.value===modelId);
+    if (!opt) { opt = document.createElement('option'); opt.value=modelId; opt.textContent=modelId; sel.appendChild(opt); }
+    sel.value = modelId;
+  }, 450);
+}
 
 // ─── Admin: Announcements ─────────────────────────────────────────────────────
 
