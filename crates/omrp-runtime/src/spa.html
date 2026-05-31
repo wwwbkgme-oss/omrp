@@ -574,46 +574,142 @@ async function renderDashboard(ca) {
 // ─── Playground ───────────────────────────────────────────────────────────────
 
 async function renderPlayground(ca) {
-  const {data:models=[]} = await GET('/v1/models');
-  const realModels = models.filter(m=>!['auto','omrp/auto','omrp/auto-free'].includes(m.id));
+  const [{data:models=[]}, pkeys] = await Promise.all([
+    GET('/v1/models'),
+    GET('/api/user/provider-keys').catch(()=>({data:[]})),
+  ]);
+  const userKeys   = pkeys.data || [];
+  const realModels = models.filter(m => !['omrp/auto','omrp/auto-free'].includes(m.id));
+  const hasKeys    = userKeys.some(k => k.is_active);
+
+  // Group models by provider
+  const grouped = {};
+  for (const m of realModels) {
+    const g = m.owned_by || 'other';
+    (grouped[g] = grouped[g]||[]).push(m);
+  }
+  const modelOpts = realModels.sort((a,b)=>{
+    if (a.owned_by !== b.owned_by) return (a.owned_by||'').localeCompare(b.owned_by||'');
+    return a.id.localeCompare(b.id);
+  }).map(m => `<option value="${esc(m.id)}" data-prov="${esc(m.owned_by||'')}">${esc(m.id)}</option>`).join('');
 
   ca.innerHTML = `
-    <div style="display:flex;flex-direction:column;height:calc(100vh - var(--topbar-h) - 32px);gap:12px">
-      <!-- Controls bar -->
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <select id="pg-model" class="form-select" style="max-width:280px">
+    <div style="display:flex;flex-direction:column;height:calc(100vh - var(--topbar-h) - 32px);gap:10px">
+
+      <!-- ── No-key warning + quick-add ── -->
+      ${!hasKeys && realModels.length===0 ? `
+      <div style="background:var(--orange)18;border:1px solid var(--orange)40;border-radius:var(--r8);padding:14px 16px">
+        <div style="display:flex;align-items:flex-start;gap:12px">
+          <span style="font-size:20px">⚠</span>
+          <div style="flex:1">
+            <div style="font-weight:700;font-size:13px;color:var(--orange);margin-bottom:6px">No provider keys configured — add one to start chatting</div>
+            <div style="font-size:12px;color:var(--text2);margin-bottom:10px">
+              Get a free key at <a href="https://openrouter.ai/keys" target="_blank" style="color:var(--cyan)">openrouter.ai/keys</a>
+              or <a href="https://console.groq.com" target="_blank" style="color:var(--cyan)">console.groq.com</a>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+              <div>
+                <div class="form-label">Provider</div>
+                <select id="qk-prov" class="form-select" style="max-width:140px;margin-top:4px">
+                  <option value="openrouter">OpenRouter</option>
+                  <option value="groq">Groq</option>
+                  <option value="cerebras">Cerebras</option>
+                  <option value="kilo">Kilo</option>
+                </select>
+              </div>
+              <div style="flex:1;min-width:180px">
+                <div class="form-label">API Key</div>
+                <input id="qk-key" class="form-input" type="password" placeholder="sk-or-v1-… / gsk_…" style="margin-top:4px">
+              </div>
+              <button id="btn-qk-add" class="btn btn-primary" style="height:36px" onclick="pgAddKey()">Add Key</button>
+            </div>
+          </div>
+        </div>
+      </div>` : ''}
+
+      <!-- ── Controls bar ── -->
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r8);padding:10px 12px">
+        <select id="pg-model" class="form-select" style="max-width:320px;font-size:12px">
           <option value="omrp/auto">⚡ omrp/auto (smart routing)</option>
-          ${realModels.sort((a,b)=>a.id.localeCompare(b.id)).map(m=>`
-            <option value="${esc(m.id)}">${esc(m.id)} (${esc(m.owned_by||'')})</option>`).join('')}
+          ${modelOpts}
         </select>
-        <select id="pg-tier" class="form-select" style="max-width:140px">
-          <option value="">auto tier</option>
+        <select id="pg-tier" class="form-select" style="max-width:120px;font-size:12px">
+          <option value="">tier: auto</option>
           <option value="simple">🟢 simple</option>
           <option value="medium">🔵 medium</option>
           <option value="complex">🟡 complex</option>
           <option value="reasoning">🟣 reasoning</option>
         </select>
-        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer">
+        <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text2);cursor:pointer;white-space:nowrap">
           <input type="checkbox" id="pg-stream" checked> Stream
         </label>
-        <button class="btn btn-ghost" style="margin-left:auto;font-size:12px" onclick="pgClear()">Clear</button>
+        ${!hasKeys ? `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;white-space:nowrap;color:var(--orange)" onclick="pgToggleKeyPanel()">
+          + Add provider key</button>` : ''}
+        <button class="btn btn-ghost" style="margin-left:auto;font-size:12px;padding:4px 10px" onclick="pgClear()">✕ Clear</button>
       </div>
-      <!-- Messages -->
+
+      <!-- ── Collapsible key-add panel (visible when user has keys but wants to add more) ── -->
+      <div id="pg-key-panel" style="display:none;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r8);padding:12px">
+        <div style="font-size:12px;font-weight:600;color:var(--text1);margin-bottom:8px">Add Provider Key</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+          <div>
+            <div class="form-label">Provider</div>
+            <select id="qk-prov2" class="form-select" style="max-width:140px;margin-top:4px">
+              <option value="openrouter">OpenRouter</option>
+              <option value="groq">Groq</option>
+              <option value="cerebras">Cerebras</option>
+              <option value="kilo">Kilo</option>
+            </select>
+          </div>
+          <div style="flex:1;min-width:200px">
+            <div class="form-label">API Key</div>
+            <input id="qk-key2" class="form-input" type="password" placeholder="Paste key here…" style="margin-top:4px">
+          </div>
+          <button id="btn-qk-add2" class="btn btn-primary" style="height:36px" onclick="pgAddKey2()">Add</button>
+          <button class="btn btn-ghost" style="height:36px" onclick="pgToggleKeyPanel()">Cancel</button>
+        </div>
+      </div>
+
+      <!-- ── Messages ── -->
       <div id="pg-msgs" style="flex:1;overflow-y:auto;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r8);padding:14px;display:flex;flex-direction:column;gap:12px">
-        <div style="color:var(--text2);font-size:12px;text-align:center;margin:auto">Send a message to test the routing engine directly from the admin panel.</div>
+        <div style="color:var(--text2);font-size:12px;text-align:center;margin:auto">
+          ${realModels.length===0 && !hasKeys
+            ? 'Add a provider key above to start chatting.'
+            : 'Send a message to test the LLM router. <span style="color:var(--text3)">omrp/auto</span> routes to the best available model.'}
+        </div>
       </div>
-      <!-- Input -->
+
+      <!-- ── Input ── -->
       <div style="display:flex;gap:8px;align-items:flex-end">
         <textarea id="pg-inp" rows="2" class="form-input" style="flex:1;resize:none;min-height:60px" placeholder="Message… (Enter=send, Shift+Enter=newline)"></textarea>
         <button id="pg-send" class="btn btn-primary" style="height:60px;padding:0 20px" onclick="pgSend()">Send ↵</button>
       </div>
     </div>`;
 
-  // Keyboard binding
   document.getElementById('pg-inp').addEventListener('keydown', e => {
     if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); pgSend(); }
   });
 }
+
+function pgToggleKeyPanel() {
+  const p = document.getElementById('pg-key-panel');
+  if (p) p.style.display = p.style.display==='none' ? 'block' : 'none';
+}
+
+async function pgAddKey(secondaryForm) {
+  const suf = secondaryForm ? '2' : '';
+  const prov = (document.getElementById('qk-prov'+suf)||{}).value;
+  const key  = (document.getElementById('qk-key'+suf)||{}).value?.trim();
+  if (!prov || !key) { toast('Provider and key required','err'); return; }
+  const btnId = 'btn-qk-add'+suf;
+  const done = loadBtn(btnId, 'Adding…');
+  const r = await POST('/api/user/provider-keys', { provider: prov, key_value: key, label: prov+' (playground)' });
+  done();
+  if (r.error) { toast(r.error.message,'err'); return; }
+  toast('Key added — refreshing models…');
+  await renderPlayground(document.getElementById('content-area'));
+}
+async function pgAddKey2() { return pgAddKey(true); }
 
 let pgBusy = false, pgHist = [];
 
