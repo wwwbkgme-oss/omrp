@@ -12,7 +12,6 @@
 
 mod config;
 mod dashboard;
-mod keys;
 mod provider;
 mod server;
 
@@ -423,7 +422,6 @@ fn cmd_init() {
             println!("  export GROQ_API_KEY=...         # ultra-low latency");
             println!("  export KILO_API_KEY=...         # kilo/auto-free smart router");
             println!("  export OPENROUTER_API_KEY=...   # 50-1000 req/day");
-            println!("  export BUW_API_KEY=...          # BUW virtual model gateway");
             println!();
             println!("Then route:");
             println!("  omrp route --task code \"write fibonacci in Rust\"");
@@ -525,5 +523,4 @@ fn print_usage() {
     eprintln!("API keys (set for the providers you use):");
     eprintln!("  CEREBRAS_API_KEY      GROQ_API_KEY");
     eprintln!("  KILO_API_KEY          OPENROUTER_API_KEY");
-    eprintln!("  BUW_API_KEY");
 }

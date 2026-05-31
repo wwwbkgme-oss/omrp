@@ -12,11 +12,29 @@ path = "src/main.rs"
 omrp-types  = { path = "../omrp-types" }
 omrp-events = { path = "../omrp-events" }
 omrp-core   = { path = "../omrp-core" }
-serde.workspace    = true
+serde.workspace      = true
 serde_json.workspace = true
-ureq.workspace     = true
-toml.workspace     = true
-dirs.workspace     = true
-ratatui.workspace  = true
-crossterm.workspace = true
-tiny_http.workspace = true
+ureq.workspace       = true
+toml.workspace       = true
+dirs.workspace       = true
+ratatui.workspace    = true
+crossterm.workspace  = true
+tiny_http.workspace  = true
+
+# async runtime + web
+tokio.workspace      = true
+axum.workspace       = true
+tower.workspace      = true
+tower-http.workspace = true
+
+# database
+rusqlite.workspace   = true
+
+# auth / crypto
+argon2.workspace     = true
+jsonwebtoken.workspace = true
+uuid.workspace       = true
+rand.workspace       = true
+
+# misc
+chrono.workspace     = true

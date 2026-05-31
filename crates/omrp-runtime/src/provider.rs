@@ -6,7 +6,6 @@
 //!   - Kilo       : `KILO_API_KEY`         https://kilo.ai
 //!   - Cerebras   : `CEREBRAS_API_KEY`     https://cloud.cerebras.ai
 //!   - Groq       : `GROQ_API_KEY`         https://console.groq.com
-//!   - BUW        : `BUW_API_KEY`          https://api.buw.xyz
 
 use std::time::{Duration, Instant};
 
@@ -30,8 +29,6 @@ pub enum ProviderKind {
     Cerebras,
     /// https://console.groq.com — GROQ_API_KEY — 1,000-14,400 req/day, ultra-low latency
     Groq,
-    /// https://api.buw.xyz — BUW_API_KEY — BUW virtual model gateway
-    Buw,
 }
 
 impl ProviderKind {
@@ -42,7 +39,6 @@ impl ProviderKind {
             "kilo"       => Some(Self::Kilo),
             "cerebras"   => Some(Self::Cerebras),
             "groq"       => Some(Self::Groq),
-            "buw"        => Some(Self::Buw),
             _ => None,
         }
     }
@@ -53,7 +49,6 @@ impl ProviderKind {
             Self::Kilo       => "https://api.kilo.ai/api/gateway",
             Self::Cerebras   => "https://api.cerebras.ai/v1",
             Self::Groq       => "https://api.groq.com/openai/v1",
-            Self::Buw        => "https://api.buw.xyz/v1",
         }
     }
 
@@ -63,7 +58,6 @@ impl ProviderKind {
             Self::Kilo       => "KILO_API_KEY",
             Self::Cerebras   => "CEREBRAS_API_KEY",
             Self::Groq       => "GROQ_API_KEY",
-            Self::Buw        => "BUW_API_KEY",
         }
     }
 
@@ -74,7 +68,6 @@ impl ProviderKind {
             Self::Kilo       => "Kilo Gateway",
             Self::Cerebras   => "Cerebras",
             Self::Groq       => "Groq",
-            Self::Buw        => "BUW",
         }
     }
 }
@@ -126,7 +119,7 @@ impl CompatClient {
     pub fn for_provider(provider: &str) -> Result<Self, String> {
         let kind = ProviderKind::from_str(provider).ok_or_else(|| {
             format!(
-                "Unknown provider: {provider:?}. Supported: openrouter, kilo, cerebras, groq, buw"
+                "Unknown provider: {provider:?}. Supported: openrouter, kilo"
             )
         })?;
         Self::from_kind(kind)
@@ -147,7 +140,6 @@ impl CompatClient {
                     ProviderKind::Kilo       => "https://kilo.ai",
                     ProviderKind::Cerebras   => "https://cloud.cerebras.ai",
                     ProviderKind::Groq       => "https://console.groq.com",
-                    ProviderKind::Buw        => "https://api.buw.xyz",
                 }
             )
         })?;
@@ -357,8 +349,6 @@ mod tests {
         assert_eq!(ProviderKind::from_str("cerebras"),   Some(ProviderKind::Cerebras));
         assert_eq!(ProviderKind::from_str("groq"),       Some(ProviderKind::Groq));
         assert_eq!(ProviderKind::from_str("Groq"),       Some(ProviderKind::Groq));
-        assert_eq!(ProviderKind::from_str("buw"),        Some(ProviderKind::Buw));
-        assert_eq!(ProviderKind::from_str("BUW"),        Some(ProviderKind::Buw));
         assert_eq!(ProviderKind::from_str("unknown"),    None);
     }
 
@@ -368,7 +358,6 @@ mod tests {
         assert!(ProviderKind::Kilo.base_url().contains("kilo.ai"));
         assert!(ProviderKind::Cerebras.base_url().contains("cerebras"));
         assert!(ProviderKind::Groq.base_url().contains("groq"));
-        assert!(ProviderKind::Buw.base_url().contains("buw.xyz"));
     }
 
     #[test]
