@@ -722,32 +722,132 @@ async function renderLogs(ca) {
 }
 
 async function renderProxies(ca) {
-  const {data:proxies=[]} = await GET('/api/admin/proxies');
+  const [{data:proxies=[]}, {data:settings=[]}] = await Promise.all([
+    GET('/api/admin/proxies'),
+    GET('/api/admin/settings'),
+  ]);
+  const sv = k => (settings.find(s=>s.key===k)||{}).value || '';
+  const enabled  = sv('proxy.enabled') === '1';
+  const srcUrl   = sv('proxy.source_url');
+  const interval = sv('proxy.refresh_interval') || '3600';
+
   ca.innerHTML = `
-    <div class="section-header">
-      <div><div class="section-title">Proxy Pool</div><div class="section-sub">${proxies.length} active proxies</div></div>
-      <button class="btn btn-primary" onclick="refreshProxies()">⟳ Refresh Pool</button>
+    <!-- ── Status banner ── -->
+    <div style="background:${enabled?'var(--green-dim)':'var(--bg2)'};border:1px solid ${enabled?'var(--green)40':'var(--border)'};border-radius:var(--r8);padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:14px">
+      <div style="font-size:22px">${enabled?'⊛':'○'}</div>
+      <div style="flex:1">
+        <div style="font-weight:700;font-size:14px;color:${enabled?'var(--green)':'var(--text1)'}">
+          Proxy Rate-Limit Bypass — ${enabled?'ENABLED':'DISABLED'}
+        </div>
+        <div style="font-size:12px;color:var(--text2);margin-top:3px">
+          ${enabled
+            ? `Active — ${proxies.length} proxies in pool. On any 429, the system instantly retries via a different IP.`
+            : 'Disabled — the system waits on rate limits. Enable to bypass per-IP quotas automatically.'}
+        </div>
+      </div>
+      <button class="btn ${enabled?'btn-danger':'btn-primary'}" onclick="toggleProxy(${enabled})" style="white-space:nowrap">
+        ${enabled?'Disable':'Enable'}
+      </button>
     </div>
+
+    <!-- ── How it works ── -->
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header"><div class="card-title">How rate-limit bypass works</div></div>
+      <div class="card-body" style="font-size:12px;color:var(--text1);line-height:1.7">
+        Free LLM providers enforce <strong>per-IP quotas</strong> (e.g. 60 req/min from your IP).<br>
+        OMRP routes each retry through a different proxy IP — so every attempt looks like a fresh request:<br>
+        <div style="margin:10px 0;padding:10px;background:var(--bg3);border-radius:var(--r4);font-family:var(--mono);font-size:11px">
+          Request → provider → 429 ← <span style="color:var(--orange)">rate limited on your IP</span><br>
+          Retry 1 → proxy 1.2.3.4 → provider → 200 ✓ &nbsp;<span style="color:var(--green)">new IP, fresh quota</span><br>
+          Retry 2 → proxy 5.6.7.8 → provider → 200 ✓ &nbsp;<span style="color:var(--green)">if proxy 1 also limited</span>
+        </div>
+        Up to <strong>12 proxies</strong> are tried before giving up. Zero delay between retries.
+      </div>
+    </div>
+
+    <!-- ── Stats + controls ── -->
     <div class="stats-grid" style="margin-bottom:16px">
-      <div class="stat-card green"><span class="stat-icon">⊛</span><div class="stat-value">${proxies.length}</div><div class="stat-label">Active Proxies</div></div>
+      <div class="stat-card ${enabled?'green':''}">
+        <span class="stat-icon">⊛</span>
+        <div class="stat-value">${proxies.length}</div>
+        <div class="stat-label">Active Proxies</div>
+      </div>
+      <div class="stat-card">
+        <span class="stat-icon">⏱</span>
+        <div class="stat-value">${Math.round(parseInt(interval)/60)}m</div>
+        <div class="stat-label">Auto-refresh</div>
+      </div>
     </div>
+
+    <!-- ── Settings ── -->
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header"><div class="card-title">Settings</div></div>
+      <div class="card-body">
+        <div style="margin-bottom:14px">
+          <div class="form-label">Source URL (ProxyScrape-compatible JSON or plain-text list)</div>
+          <div class="keys-row" style="margin-top:6px">
+            <input id="proxy-src-url" class="form-input" value="${esc(srcUrl)}" placeholder="https://api.proxyscrape.com/...">
+            <button class="btn btn-secondary" onclick="saveSettingVal('proxy.source_url',document.getElementById('proxy-src-url').value)">Save</button>
+          </div>
+        </div>
+        <div>
+          <div class="form-label">Auto-refresh interval (seconds)</div>
+          <div class="keys-row" style="margin-top:6px">
+            <input id="proxy-interval" class="form-input" value="${esc(interval)}" placeholder="3600" style="max-width:120px">
+            <button class="btn btn-secondary" onclick="saveSettingVal('proxy.refresh_interval',document.getElementById('proxy-interval').value)">Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Actions ── -->
+    <div style="display:flex;gap:10px;margin-bottom:16px">
+      <button class="btn btn-primary" onclick="refreshProxies()">⟳ Refresh Pool Now</button>
+      <span style="font-size:12px;color:var(--text2);align-self:center">Fetches a fresh proxy list from the source URL</span>
+    </div>
+
+    <!-- ── Proxy list ── -->
     <div class="card"><div class="card-body" style="padding:0"><div class="tbl-wrap">
     <table>
       <thead><tr><th>#</th><th>URL</th></tr></thead>
-      <tbody>${proxies.slice(0,50).map((p,i)=>`<tr>
+      <tbody>${proxies.length ? proxies.slice(0,100).map((p,i)=>`<tr>
         <td style="color:var(--text2);font-size:12px">${p.id}</td>
         <td><span class="mono" style="font-size:12px">${esc(p.url)}</span></td>
-      </tr>`).join('')}
-      ${proxies.length>50?`<tr><td colspan="2" style="text-align:center;color:var(--text2);padding:12px;font-size:12px">…and ${proxies.length-50} more</td></tr>`:''}
+      </tr>`).join('') : `<tr><td colspan="2"><div class="empty"><div class="empty-icon">⊛</div><div class="empty-title">No proxies in pool</div>
+        <div class="empty-sub">${enabled?'Click "Refresh Pool Now" to fetch proxies from the source URL.':'Enable proxy rotation above, then click Refresh Pool.'}</div></div></td></tr>`}
+      ${proxies.length>100?`<tr><td colspan="2" style="text-align:center;color:var(--text2);padding:12px;font-size:12px">…and ${proxies.length-100} more</td></tr>`:''}
       </tbody>
     </table>
     </div></div></div>`;
 }
 
+async function toggleProxy(currentlyEnabled) {
+  const newVal = currentlyEnabled ? '0' : '1';
+  const r = await PUT('/api/admin/settings/proxy.enabled', {value: newVal});
+  if (r.error) { toast(r.error.message,'err'); return; }
+  if (newVal === '1') {
+    toast('Proxy rotation enabled — refreshing pool…','info');
+    await refreshProxies();
+  } else {
+    toast('Proxy rotation disabled');
+  }
+  nav('proxies');
+}
+
 async function refreshProxies() {
   const r = await POST('/api/admin/proxies/refresh');
   if (r.error) toast(r.error.message,'err');
-  else toast('Proxy refresh started in background');
+  else {
+    toast(`Proxy refresh started (${r.count_before||0} proxies before)`,'info');
+    // Reload the page after a short delay to show updated count
+    setTimeout(() => nav('proxies'), 2500);
+  }
+}
+
+async function saveSettingVal(key, value) {
+  const r = await PUT(`/api/admin/settings/${encodeURIComponent(key)}`, {value});
+  if (r.error) toast(r.error.message,'err');
+  else toast('Setting saved');
 }
 
 async function renderModels(ca) {

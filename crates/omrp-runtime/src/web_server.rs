@@ -168,6 +168,37 @@ pub async fn run(cfg: Config, host: &str, port: u16) {
     println!("  Proxy pool  {} active proxies", state.proxy_pool.len());
     println!();
 
+    // ── Background proxy auto-refresh task ───────────────────────────────────
+    // When proxy.enabled=1 the pool is refreshed every refresh_interval seconds
+    // so the proxy list stays current.  Also triggers if pool drops to zero.
+    if proxy_enabled {
+        let state_bg = state.clone();
+        tokio::spawn(async move {
+            loop {
+                // Sleep for the configured interval
+                let interval = state_bg.db.get_setting("proxy.refresh_interval")
+                    .unwrap_or(None).and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(3600);
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+
+                // Check if still enabled
+                let still_on = state_bg.db.get_setting("proxy.enabled")
+                    .unwrap_or(None).map(|v| v == "1").unwrap_or(false);
+                if !still_on { break; }
+
+                let s = state_bg.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(url) = s.db.get_setting("proxy.source_url").unwrap_or(None) {
+                        eprintln!("[proxy] auto-refresh starting…");
+                        crate::proxy::refresh_proxy_pool(&s.db, &url);
+                        s.proxy_pool.load(&s.db);
+                        eprintln!("[proxy] auto-refresh done: {} proxies", s.proxy_pool.len());
+                    }
+                }).await.ok();
+            }
+        });
+    }
+
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| { eprintln!("Cannot bind {addr}: {e}"); std::process::exit(1); });
@@ -623,14 +654,20 @@ async fn admin_refresh_proxies(
     State(state): State<Arc<AppState>>, user: AuthUser,
 ) -> Response {
     if let Some(e) = require_admin(&user) { return e; }
-    // Kick off background refresh
-    let db2 = state.db.clone();
+    // Kick off background refresh, then reload the in-memory pool
     let url = state.db.get_setting("proxy.source_url").ok().flatten()
         .unwrap_or_else(|| "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json".into());
+    let s = state.clone();
     task::spawn_blocking(move || {
-        crate::proxy::refresh_proxy_pool(&db2, &url);
+        crate::proxy::refresh_proxy_pool(&s.db, &url);
+        s.proxy_pool.load(&s.db);
+        eprintln!("[proxy] manual refresh done: {} proxies", s.proxy_pool.len());
     });
-    ok(json!({ "status": "ok", "message": "Proxy refresh started in background" }))
+    ok(json!({
+        "status":  "ok",
+        "message": "Proxy refresh started — pool will reload automatically",
+        "count_before": state.proxy_pool.len()
+    }))
 }
 
 // ─── User: personal API keys ──────────────────────────────────────────────────
