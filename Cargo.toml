@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [workspace.dependencies]
@@ -22,3 +22,21 @@ dirs = "5"
 ratatui = "0.29"
 crossterm = "0.28"
 tiny_http = "0.12"
+
+# ── New: async runtime + web framework ────────────────────────────────────────
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+# ── New: database ─────────────────────────────────────────────────────────────
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# ── New: auth / crypto ────────────────────────────────────────────────────────
+argon2   = "0.5"
+jsonwebtoken = "9"
+uuid     = { version = "1", features = ["v4"] }
+rand     = "0.8"
+
+# ── New: misc ────────────────────────────────────────────────────────────────
+chrono   = { version = "0.4", features = ["serde"] }

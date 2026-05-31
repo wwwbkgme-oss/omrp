@@ -29,6 +29,8 @@ pub enum ProviderKind {
     Cerebras,
     /// https://console.groq.com — GROQ_API_KEY — 1,000-14,400 req/day, ultra-low latency
     Groq,
+    /// https://api.buw.xyz — BUW_API_KEY — BUW virtual model gateway
+    Buw,
 }
 
 impl ProviderKind {
@@ -39,6 +41,7 @@ impl ProviderKind {
             "kilo"       => Some(Self::Kilo),
             "cerebras"   => Some(Self::Cerebras),
             "groq"       => Some(Self::Groq),
+            "buw"        => Some(Self::Buw),
             _ => None,
         }
     }
@@ -49,6 +52,7 @@ impl ProviderKind {
             Self::Kilo       => "https://api.kilo.ai/api/gateway",
             Self::Cerebras   => "https://api.cerebras.ai/v1",
             Self::Groq       => "https://api.groq.com/openai/v1",
+            Self::Buw        => "https://api.buw.xyz/v1",
         }
     }
 
@@ -58,6 +62,7 @@ impl ProviderKind {
             Self::Kilo       => "KILO_API_KEY",
             Self::Cerebras   => "CEREBRAS_API_KEY",
             Self::Groq       => "GROQ_API_KEY",
+            Self::Buw        => "BUW_API_KEY",
         }
     }
 
@@ -68,6 +73,7 @@ impl ProviderKind {
             Self::Kilo       => "Kilo Gateway",
             Self::Cerebras   => "Cerebras",
             Self::Groq       => "Groq",
+            Self::Buw        => "BUW",
         }
     }
 }
@@ -140,10 +146,19 @@ impl CompatClient {
                     ProviderKind::Kilo       => "https://kilo.ai",
                     ProviderKind::Cerebras   => "https://cloud.cerebras.ai",
                     ProviderKind::Groq       => "https://console.groq.com",
+                    ProviderKind::Buw        => "https://api.buw.xyz",
                 }
             )
         })?;
         Ok(Self { base_url: kind.base_url().into(), api_key, kind })
+    }
+
+    /// Build a client using an explicit API key (e.g. stored in the database).
+    /// This bypasses the env-var lookup used by `for_provider`.
+    pub fn from_key_and_provider(provider: &str, api_key: &str) -> Result<Self, String> {
+        let kind = ProviderKind::from_str(provider)
+            .ok_or_else(|| format!("Unknown provider: {provider:?}"))?;
+        Ok(Self { base_url: kind.base_url().into(), api_key: api_key.to_string(), kind })
     }
 
     /// Provider name for display.

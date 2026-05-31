@@ -10,10 +10,16 @@
 //!   omrp dashboard    Live TUI dashboard
 //!   omrp init         Write default config
 
+mod auth;
 mod config;
 mod dashboard;
+mod db;
+mod keys;
 mod provider;
+mod proxy;
+mod routing;
 mod server;
+mod web_server;
 
 use std::path::Path;
 
@@ -470,8 +476,6 @@ fn main() {
         "serve" => {
             let mut port: u16 = 18800;
             let mut host = "127.0.0.1".to_string();
-            let mut srv_rtk = false;
-            let mut srv_caveman: Option<CavemanLevel> = None;
             let mut i = 2usize;
             while i < args.len() {
                 match args[i].as_str() {
@@ -483,18 +487,16 @@ fn main() {
                         i += 1;
                         if let Some(h) = args.get(i) { host = h.clone(); }
                     }
-                    "--rtk" => srv_rtk = true,
-                    "--caveman" | "-c" => {
-                        i += 1;
-                        if let Some(l) = args.get(i) {
-                            srv_caveman = CavemanLevel::from_str(l);
-                        }
-                    }
                     _ => {}
                 }
                 i += 1;
             }
-            server::run(&cfg, &host, port, srv_rtk, srv_caveman);
+            // Start the axum web server (multi-user dashboard + LLM proxy).
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(web_server::run(cfg, &host, port));
         }
         "init" => cmd_init(),
         other => {

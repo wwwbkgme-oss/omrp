@@ -2,22 +2,30 @@ use omrp_types::model::Model;
 use omrp_types::task::RouteRequest;
 use crate::state::HealthStatus;
 
+/// BKG-FMR — Best Known Garbage-Free Models Router scoring weights.
+///
+/// All weights should sum to ≤ 1.0; the remainder goes to the capability bonus.
 pub struct ScoringWeights {
+    /// Bayesian competence: α/(α+β) posterior mean success rate.
     pub health: f64,
+    /// Inverted EMA latency: lower latency → higher score.
     pub latency: f64,
+    /// Bayesian posterior mean = primary competence signal.
     pub success_rate: f64,
+    /// Beta distribution stability: inverse variance (more obs = more stable).
     pub stability: f64,
+    /// Load pressure: fraction of max-inflight capacity available.
     pub load: f64,
 }
 
 impl Default for ScoringWeights {
     fn default() -> Self {
         Self {
-            health: 0.35,
-            latency: 0.20,
+            health:       0.35,
+            latency:      0.20,
             success_rate: 0.25,
-            stability: 0.10,
-            load: 0.10,
+            stability:    0.10,
+            load:         0.10,
         }
     }
 }
@@ -32,8 +40,12 @@ impl Scorer {
     }
 
     /// Score a model for a given task and load state.
-    /// Returns (total_score, vec_of_factors).
-    /// Deterministic: same inputs → same result.
+    ///
+    /// Returns `(total_score, vec_of_factors)`.
+    ///
+    /// ## Determinism guarantee
+    /// Same inputs always produce the same result — no randomness here.
+    /// For probabilistic selection (Thompson Sampling) see `RouterEngine::select_thompson`.
     pub fn score(
         &self,
         model: &Model,
@@ -43,27 +55,31 @@ impl Scorer {
     ) -> (f64, Vec<omrp_types::routing::ScoreFactor>) {
         let mut factors = Vec::new();
 
-        // Health score
+        // ── Health (garbage gate) ─────────────────────────────────────────────
+        // Models flagged by the Wilson Score garbage detector score 0.0.
         let h = self.health_score(health);
         factors.push(omrp_types::routing::ScoreFactor::new("health", h, self.weights.health));
 
-        // Latency score
+        // ── Latency ───────────────────────────────────────────────────────────
         let l = self.latency_score(health);
         factors.push(omrp_types::routing::ScoreFactor::new("latency", l, self.weights.latency));
 
-        // Success rate score
-        let sr = self.success_rate_score(health);
+        // ── Bayesian competence (success_rate factor) ─────────────────────────
+        // Uses posterior mean of Beta(α,β) with Laplace smoothing.
+        // Prior = Beta(1,1) = uniform (no prior knowledge).
+        let sr = health.bayesian_competence();
         factors.push(omrp_types::routing::ScoreFactor::new("success_rate", sr, self.weights.success_rate));
 
-        // Stability score
-        let st = self.stability_score(health);
+        // ── Stability (Beta variance) ─────────────────────────────────────────
+        // Decreases as the model's performance variance increases.
+        let st = health.stability_score();
         factors.push(omrp_types::routing::ScoreFactor::new("stability", st, self.weights.stability));
 
-        // Load score
+        // ── Load ──────────────────────────────────────────────────────────────
         let ld = self.load_score(inflight, request.max_inflight_per_model.unwrap_or(3));
         factors.push(omrp_types::routing::ScoreFactor::new("load", ld, self.weights.load));
 
-        // Capability match bonus
+        // ── Capability match bonus ────────────────────────────────────────────
         let bonus = self.capability_match(model, request);
 
         let total = factors.iter().map(|f| f.contribution()).sum::<f64>() + bonus;
@@ -84,17 +100,6 @@ impl Scorer {
         }
         // 500ms = 1.0, 10s = 0.0
         f64::max(0.0, 1.0 - (health.rolling_latency_avg_ms - 500.0) / 9500.0)
-    }
-
-    fn success_rate_score(&self, health: &HealthStatus) -> f64 {
-        if health.last_success == omrp_types::time::SequencedInstant::EPOCH && health.last_failure == omrp_types::time::SequencedInstant::EPOCH {
-            return 0.5; // no data → neutral
-        }
-        health.success_ratio as f64
-    }
-
-    fn stability_score(&self, health: &HealthStatus) -> f64 {
-        if health.last_success > health.last_failure { 1.0 } else { 0.0 }
     }
 
     fn load_score(&self, inflight: u32, max_inflight: u32) -> f64 {
@@ -143,13 +148,11 @@ mod tests {
                 context_window: 8192,
             },
         };
-        let health = HealthStatus {
-            last_success: omrp_types::time::SequencedInstant { seq: 10, logical_time: 10 },
-            last_failure: omrp_types::time::SequencedInstant::EPOCH,
-            success_ratio: 0.9,
-            rolling_latency_avg_ms: 800.0,
-            garbage: false,
-        };
+        let mut health = HealthStatus::new();
+        health.last_success = omrp_types::time::SequencedInstant { seq: 10, logical_time: 10 };
+        health.rolling_latency_avg_ms = 800.0;
+        health.success_count = 9;
+        health.failure_count = 1;
         (model, health)
     }
 
@@ -183,6 +186,8 @@ mod tests {
             success_ratio: 0.1,
             rolling_latency_avg_ms: 5000.0,
             garbage: true,
+            success_count: 0,
+            failure_count: 20,
         };
         let (total, _) = scorer.score(&model, &health, 0, &RouteRequest::default());
         assert!(total < 0.5, "garbage model should score low, got {total}");
@@ -193,10 +198,8 @@ mod tests {
         let scorer = default_scorer();
         let (model, health) = healthy_model();
         let request = RouteRequest { max_inflight_per_model: Some(2), ..Default::default() };
-
         let (idle, _) = scorer.score(&model, &health, 0, &request);
         let (busy, _) = scorer.score(&model, &health, 2, &request);
-
         assert!(idle > busy, "busy model should score lower than idle");
     }
 
@@ -217,4 +220,31 @@ mod tests {
         let (score_without, _) = scorer.score(&model, &health, 0, &request_no_match);
         assert!(score_with > score_without, "capability match should increase score");
     }
+
+    #[test]
+    fn test_bayesian_competence_improves_with_successes() {
+        let mut health = HealthStatus::new();
+        let low = health.bayesian_competence();   // α=1, β=1 → 0.5
+        health.success_count = 99;
+        let high = health.bayesian_competence();  // α=100, β=1 → ~0.99
+        assert!(high > low, "more successes → higher competence");
+    }
+
+    #[test]
+    fn test_wilson_score_lower_zero_obs() {
+        let health = HealthStatus::new();
+        let ws = health.wilson_lower();
+        assert!((ws - 0.5).abs() < 0.01, "no data → neutral 0.5");
+    }
+
+    #[test]
+    fn test_stability_increases_with_observations() {
+        let mut health = HealthStatus::new();
+        let low_stab = health.stability_score();  // few observations → high variance
+        health.success_count = 1000;
+        health.failure_count = 100;
+        let high_stab = health.stability_score();
+        assert!(high_stab > low_stab, "more observations → higher stability");
+    }
 }
+

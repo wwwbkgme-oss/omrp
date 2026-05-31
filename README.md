@@ -1,9 +1,11 @@
 # OMRP — Open Model Routing Protocol
 
-> **Status:** Phase 1 complete — kernel bootstrapped and usable  
+> **Status:** v0.2.0 — multi-user web app, SQLite persistence, BUW provider  
 > **Architecture:** Event-sourced, deterministic, replay-safe LLM routing engine
 
-```
+```bash
+omrp serve                   # multi-user dashboard on :18800
+omrp route --task code "…"   # one-shot routing from CLI
 cargo run -p omrp-runtime -- best code
 ```
 
@@ -11,36 +13,22 @@ cargo run -p omrp-runtime -- best code
 
 ## What is OMRP?
 
-OMRP is a local LLM routing daemon that selects the best available model for each request. Every routing decision is **deterministic**: given the same event history and the same request, OMRP always picks the same model. There is no randomness, no hidden state, and no wall-clock time in any reducer.
+OMRP is a local LLM routing daemon that selects the best available model for
+each request. Every routing decision is **deterministic**: given the same event
+history and the same request, OMRP always picks the same model.
 
-## Key Properties
-
-### Deterministic Routing
-- Same ledger + same request → same routing decision, always
-- No `rand`, no `SystemTime::now()`, no external reads inside reducers
-- Deterministic tiebreaking: lexicographic by `model_id`
-
-### Tamper-Evident Ledger
-- Every event is SHA-256 chained to the previous one
-- Any modification to any entry is immediately detectable
-- Append-only: history cannot be rewritten
-- Full replay from any checkpoint
-
-### BKG-FMR Scoring Engine
-*Best Known Garbage-Free Models Router*
-- 5-factor scoring: `health (0.35) + latency (0.20) + success_rate (0.25) + stability (0.10) + load (0.10)`
-- EMA-based success ratio: degrades continuously under failures
-- Garbage exclusion: models below threshold are removed from routing
-- Capability matching bonus for task-specific suitability
-
-### Event-Sourced Architecture
-```
-Events → Validate → LedgerStore → dispatch() → State → RouterEngine → RoutingDecision
-```
-Three logical machines, one data flow:
-1. **Ledger Machine** — append-only, SHA-256 chained source of truth
-2. **Reducer Machine** — pure `dispatch(&mut State, &Event)`, no IO
-3. **Scheduler Machine** — `select(state, request)`, pure function
+The v0.2 web server adds:
+- **Multi-user dashboard** — admin and user roles, JWT auth, onboarding wizard
+- **SQLite persistence** — users, API keys, provider keys, audit logs, request
+  stats, proxy pool
+- **Database-backed provider keys** — set API keys per user or globally, no
+  env-var required once configured
+- **API key management** — generate `omrp-sk-…` tokens for tools like Cursor,
+  Claude Desktop, or Continue to authenticate against the proxy
+- **Proxy pool** — automatic fetch and rotation from ProxyScrape-compatible
+  sources
+- **BUW provider** — new gateway (`BUW_API_KEY`) with `buw/omrp-auto` and
+  `buw/auto-kilo` virtual models
 
 ---
 
@@ -50,98 +38,88 @@ Three logical machines, one data flow:
 # Build
 cargo build
 
-# Run all tests (34 tests, 0 failures)
-cargo test
+# Start multi-user server (first run shows onboarding wizard)
+cargo run -p omrp-runtime -- serve --host 0.0.0.0 --port 18800
 
-# CLI commands
-cargo run -p omrp-runtime -- models           # list registered models
-cargo run -p omrp-runtime -- status           # health + routing scores
-cargo run -p omrp-runtime -- best code        # best model for coding tasks
-cargo run -p omrp-runtime -- best reasoning   # best model for reasoning
-cargo run -p omrp-runtime -- best vision      # best model for vision tasks
+# Or: one-shot routing (no server)
+export OPENROUTER_API_KEY=sk-…
+omrp route --task code "write a fibonacci in Rust"
 ```
 
-### Example output
+Open **http://localhost:18800** — the setup wizard creates your admin account on
+first run.
 
+---
+
+## CLI commands
+
+```bash
+omrp route   [--task T] [--tier T] [--max-tokens N] <prompt|stdin>
+omrp serve   [--port N] [--host H]
+omrp models                          # list registered models
+omrp status                          # health + routing scores
+omrp best <task>                     # best model for a task (no API call)
+omrp dashboard                       # live TUI (q to quit)
+omrp init                            # create default config
 ```
-$ cargo run -p omrp-runtime -- best code
-Best model for "code": qwen/qwen-2-5-72b
-Score: 1.076
 
-Score breakdown:
-  health          value=1.000  weight=0.35  contribution=0.350
-  latency         value=1.038  weight=0.20  contribution=0.208
-  success_rate    value=0.672  weight=0.25  contribution=0.168
-  stability       value=1.000  weight=0.10  contribution=0.100
-  load            value=1.000  weight=0.10  contribution=0.100
+---
 
-Fallback chain: openrouter/claude-3-5-sonnet → openrouter/gpt-4o
-```
+## Providers
+
+| Provider    | Env Var              | Free models           |
+|-------------|----------------------|-----------------------|
+| Cerebras    | `CEREBRAS_API_KEY`   | 14,400 req/day        |
+| Groq        | `GROQ_API_KEY`       | 1k–14k req/day        |
+| Kilo        | `KILO_API_KEY`       | kilo/auto-free router |
+| OpenRouter  | `OPENROUTER_API_KEY` | 50–1000 req/day       |
+| BUW         | `BUW_API_KEY`        | Virtual gateway       |
+
+Keys can also be set via the web dashboard → Provider Keys (no restart needed).
+
+---
+
+## Key Properties
+
+### Deterministic Routing
+- Same ledger + same request → same routing decision, always
+- No `rand`, no `SystemTime::now()`, no external reads inside reducers
+
+### Tamper-Evident Ledger
+- Every event is SHA-256 chained to the previous one
+- Append-only: history cannot be rewritten
+
+### BKG-FMR Scoring Engine
+*Best Known Garbage-Free Models Router*
+- 5-factor scoring: `health (0.35) + latency (0.20) + success_rate (0.25) + stability (0.10) + load (0.10)`
+
+### Multi-User Web Application (v0.2+)
+- SQLite-backed: users, roles, permissions, API keys, request logs, proxy pool
+- JWT authentication with Argon2id password hashing
+- Admin dashboard: user management, role-based access, key management, audit logs
+- User dashboard: personal API keys, provider keys, usage statistics
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                  omrp-runtime (CLI)                       │
-│  models | status | best <task>                            │
-└───────────────────────┬──────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                  omrp-runtime                                  │
+│  serve (axum) | route | models | status | best | dashboard    │
+└───────────────────────┬──────────────────────────────────────┘
                         │ uses
-┌───────────────────────▼──────────────────────────────────┐
-│                   omrp-core                               │
-│                                                           │
-│  EventPipeline ──► LedgerStore (SHA-256 chain)           │
-│       │                                                   │
-│       ▼                                                   │
-│  dispatch(&mut State, &Event)  ← pure reducer             │
-│       │                                                   │
-│       ▼                                                   │
-│  State { models, health, inflight, routing_cache, diag }  │
-│       │                                                   │
-│       ▼                                                   │
-│  RouterEngine::select(state, request)  ← pure function    │
-│       │                                                   │
-│       ▼                                                   │
-│  RoutingDecision { model, score, factors, fallback_chain } │
-└──────────────────────────────────────────────────────────┘
+┌───────────────────────▼──────────────────────────────────────┐
+│                   omrp-core                                    │
+│  EventPipeline ──► LedgerStore (SHA-256 chain)               │
+│  dispatch(&mut State, &Event)  ← pure reducer                 │
+│  RouterEngine::select(state, request)  ← pure function        │
+└──────────────────────────────────────────────────────────────┘
         depends on
-┌───────────────────────────────────────────────────────────┐
-│  omrp-events          │  omrp-types                       │
-│  Event enum           │  Model, ModelCapabilities         │
-│  ErrorKind            │  TaskType, RouteRequest           │
-│  ValidationError      │  RoutingDecision, ScoreFactor     │
-│  validate()           │  SequencedInstant, Clock          │
-└───────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│  omrp-events          │  omrp-types                           │
+└───────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## Crates
-
-| Crate | Description |
-|-------|-------------|
-| `omrp-types` | Shared types: `Model`, `TaskType`, `RouteRequest`, `RoutingDecision`, `SequencedInstant`, `Clock` |
-| `omrp-events` | Event definitions, `ErrorKind`, `ValidationError`, `validate()` |
-| `omrp-core` | Engine: `State`, `dispatch()`, `EventPipeline`, `LedgerStore`, `Scorer`, `RouterEngine` |
-| `omrp-runtime` | CLI binary (`omrp models \| status \| best <task>`) |
-
----
-
-## Phase 1 Status
-
-- [x] `omrp-types` — `SequencedInstant`, `Clock`, `Model`, `TaskType`, `RoutingDecision`
-- [x] `omrp-events` — `Event` enum (14 variants), `ErrorKind`, `validate()`
-- [x] `omrp-core/state` — `State`, `HealthStatus`, `Diagnostics`, `RoutingCache`
-- [x] `omrp-core/reducers` — `dispatch()`, EMA success ratio, garbage detection
-- [x] `omrp-core/pipeline` — `EventPipeline` with validate → persist → apply → replay
-- [x] `omrp-core/scorer` — BKG-FMR 5-factor scoring with capability bonus
-- [x] `omrp-core/router` — `RouterEngine` with deterministic selection + fallback chain
-- [x] `omrp-core/ledger` — `LedgerStore` with SHA-256 chaining, JSON Lines persist/load
-- [x] `omrp-runtime` — CLI: `models`, `status`, `best <task>`
-- [x] Integration tests — determinism, replay identity, fuzz (34 tests total)
-
-**Phase 2 tasks** → see [`TASKS.md`](TASKS.md)
 
 ---
 
@@ -149,10 +127,10 @@ Fallback chain: openrouter/claude-3-5-sonnet → openrouter/gpt-4o
 
 | File | Description |
 |------|-------------|
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Crate graph, data flow, invariants, module details |
-| [`docs/EVENTS.md`](docs/EVENTS.md) | All 14 event variants, state effects, validation rules |
-| [`docs/ROUTING.md`](docs/ROUTING.md) | BKG-FMR scoring algorithm, garbage detection, fallback chain |
-| [`TASKS.md`](TASKS.md) | Phase 2 and beyond: next implementation tasks |
+| `docs/ARCHITECTURE.md` | Crate graph, data flow, invariants |
+| `docs/EVENTS.md`       | All 14 event variants, state effects |
+| `docs/ROUTING.md`      | BKG-FMR scoring, garbage detection |
+| `TASKS.md`             | Phase roadmap and next tasks |
 
 ---
 

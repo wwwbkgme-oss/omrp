@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        # Note: pre-existing warnings exist (see TASKS.md "cargo clippy clean" task).
+        # Using --no-deps to avoid noise from dependencies.
+        run: cargo clippy --workspace
+      - name: Format (advisory)
+        # The codebase uses column-aligned match arms which rustfmt reformats.
+        # Run as advisory only until a .rustfmt.toml is in place.
+        run: cargo fmt --check
+        continue-on-error: true
