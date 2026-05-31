@@ -38,6 +38,7 @@ use omrp_types::task::RouteRequest;
 
 use crate::bootstrap_pipeline;
 use crate::config::Config;
+use crate::keys::KeyStore;
 use crate::provider::{format_provider_error, CompatClient, Message};
 use crate::tier_from_str;
 use crate::select_for_tier;
@@ -75,16 +76,27 @@ pub fn run(cfg: &Config, host: &str, port: u16, rtk: bool, caveman: Option<Cavem
         Err(e) => { eprintln!("Cannot bind {addr}: {e}"); std::process::exit(1); }
     };
     let stats   = Arc::new(Mutex::new(Stats::new()));
+    let keys    = Arc::new(Mutex::new(KeyStore::load(KeyStore::default_path())));
     let started = Instant::now();
 
-    println!("OMRP proxy  \x1b[36mhttp://{addr}\x1b[0m");
-    println!("  Playground  http://{addr}/");
-    println!("  RTK:        {}", if rtk { "on (compresses tool outputs)" } else { "off (--rtk to enable)" });
-    println!("  Caveman:    {}", caveman.map(|l| l.as_str()).unwrap_or("off (--caveman lite|full|ultra)"));
-    println!();
+    {
+        let ks = keys.lock().unwrap();
+        println!("OMRP proxy  \x1b[36mhttp://{addr}\x1b[0m");
+        println!("  Playground  http://{addr}/");
+        println!("  API keys:   {} key(s) registered  (manage at http://{addr}/#keys)",
+            ks.keys.len());
+        if ks.auth_required() {
+            println!("  Auth:       \x1b[32mEnabled\x1b[0m — Bearer token required for API endpoints");
+        } else {
+            println!("  Auth:       off — generate keys at http://{addr}/#keys");
+        }
+        println!("  RTK:        {}", if rtk { "on (compresses tool outputs)" } else { "off (--rtk to enable)" });
+        println!("  Caveman:    {}", caveman.map(|l| l.as_str()).unwrap_or("off (--caveman lite|full|ultra)"));
+        println!();
+    }
 
     for request in server.incoming_requests() {
-        handle_request(request, cfg, &stats, started.elapsed().as_secs(), rtk, caveman);
+        handle_request(request, cfg, &stats, &keys, started.elapsed().as_secs(), rtk, caveman);
     }
 }
 
@@ -92,7 +104,7 @@ pub fn run(cfg: &Config, host: &str, port: u16, rtk: bool, caveman: Option<Cavem
 
 fn handle_request(
     req: Request, cfg: &Config, stats: &Arc<Mutex<Stats>>,
-    uptime: u64, rtk: bool, caveman: Option<CavemanLevel>,
+    keys: &Arc<Mutex<KeyStore>>, uptime: u64, rtk: bool, caveman: Option<CavemanLevel>,
 ) {
     let method = req.method().clone();
     let url    = req.url().split('?').next().unwrap_or("/").to_string();
@@ -101,10 +113,25 @@ fn handle_request(
         let _ = req.respond(
             Response::empty(204)
                 .with_header(h("Access-Control-Allow-Origin", "*"))
-                .with_header(h("Access-Control-Allow-Methods", "GET, POST, OPTIONS"))
+                .with_header(h("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"))
                 .with_header(h("Access-Control-Allow-Headers", "Content-Type, Authorization")),
         );
         return;
+    }
+
+    // ── Bearer auth guard (only for API endpoints, not playground/health/keys) ──
+    let needs_auth = matches!(
+        (method.as_str(), url.as_str()),
+        ("POST", "/v1/chat/completions") | ("POST", "/chat/completions")
+        | ("GET",  "/v1/models") | ("GET",  "/models")
+    );
+    if needs_auth {
+        let bearer = extract_bearer(req.headers());
+        let ok = keys.lock().unwrap().validate(bearer.as_deref().unwrap_or(""));
+        if !ok {
+            let _ = json_err(req, 401, "Unauthorized: invalid or missing Bearer token. Generate a key at /v1/keys or in the playground.", "auth_error");
+            return;
+        }
     }
 
     let r = match (method.as_str(), url.as_str()) {
@@ -115,9 +142,27 @@ fn handle_request(
         ("GET",  "/health")       => handle_health(req, stats, uptime),
         ("GET",  "/stats")        => handle_stats(req, stats),
         ("POST", "/reload")       => handle_reload(req, cfg),
+        // ── API key management ───────────────────────────────────────────────
+        ("GET",  "/v1/keys")      => handle_keys_list(req, keys),
+        ("POST", "/v1/keys")      => handle_keys_create(req, keys),
+        _ if method.as_str() == "DELETE" && url.starts_with("/v1/keys/")
+            => handle_keys_delete(req, keys, &url),
         _ => json_err(req, 404, &format!("Not found: {url}"), "not_found"),
     };
     if let Err(e) = r { eprintln!("[server] {e}"); }
+}
+
+/// Extract the Bearer token from `Authorization: Bearer <token>` header.
+///
+/// Uses `HeaderField::equiv` for case-insensitive field matching (tiny_http 0.12).
+fn extract_bearer(headers: &[tiny_http::Header]) -> Option<String> {
+    headers.iter()
+        .find(|h| h.field.equiv("authorization"))
+        .and_then(|h| {
+            // AsciiString implements Display; to_string() gives us a plain &str-compatible String
+            let v = h.value.to_string();
+            v.strip_prefix("Bearer ").map(|t| t.trim().to_string())
+        })
 }
 
 // ─── Playground SPA ──────────────────────────────────────────────────────────
@@ -366,6 +411,97 @@ fn handle_reload(req: Request, cfg: &Config)
     Ok(())
 }
 
+// ─── API key management ───────────────────────────────────────────────────────
+
+/// `GET /v1/keys` — list all registered keys (id, label, created; full key hidden).
+fn handle_keys_list(req: Request, keys: &Arc<Mutex<KeyStore>>)
+    -> Result<(), Box<dyn std::error::Error>>
+{
+    let ks = keys.lock().unwrap();
+    let list: Vec<Value> = ks.keys.iter().map(|k| json!({
+        "id":         k.id,
+        "label":      k.label,
+        "created":    k.created,
+        "key_prefix": &k.key[..k.key.len().min(16)],
+    })).collect();
+    let body = json!({
+        "object":        "list",
+        "data":          list,
+        "auth_required": ks.auth_required(),
+    });
+    req.respond(
+        Response::from_string(body.to_string())
+            .with_header(h("Content-Type", "application/json"))
+            .with_header(h("Access-Control-Allow-Origin", "*")),
+    )?;
+    Ok(())
+}
+
+/// `POST /v1/keys` — create a new key.
+///
+/// Body (JSON, optional): `{ "label": "Cursor" }`
+/// Response: includes the full `key` field — **shown once, not retrievable later**.
+fn handle_keys_create(mut req: Request, keys: &Arc<Mutex<KeyStore>>)
+    -> Result<(), Box<dyn std::error::Error>>
+{
+    let raw = read_body(&mut req).unwrap_or_default();
+    let label = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|v| v["label"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "default".to_string());
+    let label = label.chars().take(64).collect::<String>();
+
+    let mut ks = keys.lock().unwrap();
+    match ks.create(&label) {
+        Ok(entry) => {
+            let body = json!({
+                "id":      entry.id,
+                "key":     entry.key,
+                "label":   entry.label,
+                "created": entry.created,
+                "note":    "Copy this key — it will not be shown again.",
+            });
+            req.respond(
+                Response::from_string(body.to_string())
+                    .with_status_code(StatusCode(201))
+                    .with_header(h("Content-Type", "application/json"))
+                    .with_header(h("Access-Control-Allow-Origin", "*")),
+            )?;
+        }
+        Err(e) => {
+            json_err(req, 500, &format!("Could not create key: {e}"), "server_error")?;
+        }
+    }
+    Ok(())
+}
+
+/// `DELETE /v1/keys/{id}` — revoke a key by its short ID.
+fn handle_keys_delete(req: Request, keys: &Arc<Mutex<KeyStore>>, url: &str)
+    -> Result<(), Box<dyn std::error::Error>>
+{
+    let id = url.trim_start_matches("/v1/keys/");
+    if id.is_empty() {
+        return json_err(req, 400, "Key ID required", "invalid_request");
+    }
+    let mut ks = keys.lock().unwrap();
+    match ks.delete(id) {
+        Ok(true)  => {
+            req.respond(
+                Response::from_string(json!({"status":"ok","deleted":id}).to_string())
+                    .with_header(h("Content-Type", "application/json"))
+                    .with_header(h("Access-Control-Allow-Origin", "*")),
+            )?;
+        }
+        Ok(false) => {
+            json_err(req, 404, &format!("Key not found: {id}"), "not_found")?;
+        }
+        Err(e) => {
+            json_err(req, 500, &format!("Could not delete key: {e}"), "server_error")?;
+        }
+    }
+    Ok(())
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn extract_texts(msgs: &[Value]) -> (String, String) {
@@ -444,6 +580,34 @@ select:focus{outline:1px solid var(--accent)}
 .hdr-right{margin-left:auto;display:flex;gap:6px}
 .btn-sm{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
 .btn-sm:hover{border-color:var(--red);color:var(--red)}
+.btn-keys{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+.btn-keys:hover{border-color:var(--accent);color:var(--accent)}
+.btn-keys.active{border-color:var(--orange);color:var(--orange)}
+
+/* ── Keys panel ── */
+.keys-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100;align-items:flex-start;justify-content:center;padding-top:56px}
+.keys-overlay.open{display:flex}
+.keys-panel{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px;width:min(580px,96vw);max-height:78vh;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
+.keys-panel h3{font-size:14px;font-weight:700}
+.keys-info{font-size:12px;color:var(--muted);line-height:1.6}
+.keys-info strong{color:var(--text)}
+.keys-info code{background:var(--bg);padding:1px 5px;border-radius:4px;font-family:monospace;font-size:11px}
+.keys-row{display:flex;gap:8px;align-items:center}
+.keys-row input{flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;font-size:13px;outline:none}
+.keys-row input:focus{border-color:var(--accent)}
+.btn-gen{background:var(--accent);border:none;color:#000;border-radius:6px;padding:7px 14px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
+.key-item{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px;display:flex;align-items:center;gap:10px}
+.key-info{flex:1;min-width:0}
+.key-label{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.key-meta{font-size:11px;color:var(--muted);font-family:monospace;margin-top:3px}
+.btn-revoke{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:5px;padding:3px 9px;font-size:11px;cursor:pointer;white-space:nowrap}
+.btn-revoke:hover{border-color:var(--red);color:var(--red)}
+.key-new-box{background:var(--bg);border:1px solid var(--green);border-radius:6px;padding:10px 12px;display:flex;align-items:center;gap:8px}
+.key-new-val{flex:1;font-family:monospace;font-size:11px;color:var(--green);word-break:break-all;line-height:1.5}
+.btn-copy{background:var(--green);border:none;color:#000;border-radius:5px;padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+.auth-badge{padding:2px 8px;border-radius:8px;font-size:11px;font-weight:700;margin-left:8px}
+.auth-on{background:#0d2e18;color:var(--green)}
+.auth-off{background:#1a1f2b;color:var(--muted)}
 
 /* ── Messages ── */
 #msgs{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px;scroll-behavior:smooth}
@@ -504,9 +668,30 @@ textarea::placeholder{color:var(--muted)}
     </label>
   </div>
   <div class="hdr-right">
+    <button class="btn-keys" id="keysBtn" onclick="toggleKeys()" title="Manage API keys">🔑 Keys</button>
     <button class="btn-sm" onclick="clearChat()">Clear</button>
   </div>
 </header>
+
+<!-- ── API Keys overlay ── -->
+<div class="keys-overlay" id="keysOverlay" onclick="if(event.target===this)toggleKeys()">
+  <div class="keys-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <h3>API Keys <span id="authBadge" class="auth-badge auth-off">auth: off</span></h3>
+      <button class="btn-sm" onclick="toggleKeys()" style="padding:2px 8px">✕</button>
+    </div>
+    <div class="keys-info" id="keysInfo">Loading…</div>
+    <div class="keys-row">
+      <input id="keyLabel" placeholder='Label (e.g. "Cursor", "Claude Desktop", "Continue")' maxlength="64">
+      <button class="btn-gen" onclick="genKey()">Generate key</button>
+    </div>
+    <div id="newKeyBox" style="display:none" class="key-new-box">
+      <span class="key-new-val" id="newKeyVal"></span>
+      <button class="btn-copy" id="copyBtn" onclick="copyKey()">Copy</button>
+    </div>
+    <div id="keysList"></div>
+  </div>
+</div>
 
 <div id="msgs"></div>
 
@@ -738,6 +923,102 @@ document.getElementById('inp').addEventListener('keydown', e => {
 
 document.getElementById('rtk').addEventListener('change', e =>
   document.getElementById('rtkLbl').classList.toggle('on', e.target.checked));
+
+// ── API Keys ──────────────────────────────────────────────────────────────────
+let keysVisible = false;
+let latestKey = '';
+
+function toggleKeys() {
+  keysVisible = !keysVisible;
+  document.getElementById('keysOverlay').classList.toggle('open', keysVisible);
+  document.getElementById('keysBtn').classList.toggle('active', keysVisible);
+  if (keysVisible) loadKeys();
+}
+
+async function loadKeys() {
+  try {
+    const res = await fetch('/v1/keys');
+    const {data=[], auth_required=false} = await res.json();
+
+    const badge = document.getElementById('authBadge');
+    badge.className = 'auth-badge ' + (auth_required ? 'auth-on' : 'auth-off');
+    badge.textContent = auth_required ? 'auth: ON' : 'auth: off';
+
+    document.getElementById('keysInfo').innerHTML = auth_required
+      ? 'Bearer auth is <strong>enabled</strong>. Every API client must send:<br><code>Authorization: Bearer omrp-sk-…</code>'
+      : 'No keys registered yet — all requests are accepted. Generate a key to enable authentication.';
+
+    const list = document.getElementById('keysList');
+    list.innerHTML = '';
+    if (data.length === 0) {
+      list.innerHTML = '<div style="color:var(--muted);font-size:12px;text-align:center;padding:10px 0">No keys yet. Generate one above.</div>';
+    } else {
+      data.forEach(k => {
+        const ts = new Date(k.created * 1000).toLocaleDateString();
+        const item = document.createElement('div');
+        item.className = 'key-item';
+        item.id = 'keyrow-' + k.id;
+        item.innerHTML =
+          '<div class="key-info">' +
+            '<div class="key-label">' + esc(k.label) + '</div>' +
+            '<div class="key-meta">' + esc(k.key_prefix) + '…&nbsp;&nbsp;·&nbsp;&nbsp;created ' + ts + '&nbsp;&nbsp;·&nbsp;&nbsp;id: ' + esc(k.id) + '</div>' +
+          '</div>' +
+          '<button class="btn-revoke" onclick="revokeKey(\'' + esc(k.id) + '\')">Revoke</button>';
+        list.appendChild(item);
+      });
+    }
+  } catch(e) {
+    document.getElementById('keysInfo').textContent = 'Error loading keys: ' + e;
+  }
+}
+
+async function genKey() {
+  const label = (document.getElementById('keyLabel').value.trim() || 'default');
+  try {
+    const res = await fetch('/v1/keys', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({label}),
+    });
+    if (!res.ok) { alert('Error generating key: ' + (await res.text())); return; }
+    const {key} = await res.json();
+    latestKey = key;
+    document.getElementById('newKeyVal').textContent = key;
+    document.getElementById('newKeyBox').style.display = 'flex';
+    document.getElementById('copyBtn').textContent = 'Copy';
+    document.getElementById('keyLabel').value = '';
+    loadKeys();
+  } catch(e) { alert('Error: ' + e); }
+}
+
+async function revokeKey(id) {
+  if (!confirm('Revoke key ' + id + '?\nThis cannot be undone.')) return;
+  try {
+    await fetch('/v1/keys/' + id, {method: 'DELETE'});
+    const row = document.getElementById('keyrow-' + id);
+    if (row) row.remove();
+    loadKeys();
+    document.getElementById('newKeyBox').style.display = 'none';
+    latestKey = '';
+  } catch(e) { alert('Error: ' + e); }
+}
+
+function copyKey() {
+  if (!latestKey) return;
+  navigator.clipboard.writeText(latestKey).then(() => {
+    const btn = document.getElementById('copyBtn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+  }).catch(() => {
+    // Fallback for browsers without clipboard API
+    prompt('Copy this key (Ctrl+C):', latestKey);
+  });
+}
+
+// Close keys overlay on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && keysVisible) toggleKeys();
+});
 </script>
 </body>
 </html>"#;

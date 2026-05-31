@@ -12,6 +12,7 @@
 
 mod config;
 mod dashboard;
+mod keys;
 mod provider;
 mod server;
 
