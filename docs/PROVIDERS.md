@@ -1,9 +1,38 @@
 # OMRP Provider Setup
 
-OMRP supports 5 OpenAI-compatible providers.  All are permanently free-tier
-(no credit card required for the default model pool).
+## Configuring provider keys via the web (recommended)
+
+All provider API keys can be managed through the admin dashboard —
+no server-side file editing required:
+
+1. Open **Admin → Provider Keys**
+2. Click **+ Add Key**, select the provider, paste your API key, choose scope:
+   - **Global** — all users benefit from this key (admin adds it once)
+   - **Personal** — only you use this key (any user can add their own)
+
+**Priority:** user's personal key → admin's global key → server env var.
+
+Users can add their own personal keys via **My Providers** in their dashboard.
 
 ---
+
+## Configuring via environment variables (alternative)
+
+If you prefer environment variables on the server:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-v1-...
+export KILO_API_KEY=kilo-...
+export CEREBRAS_API_KEY=csk-...
+export GROQ_API_KEY=gsk_...
+export BUW_API_KEY=buw-...
+
+omrp serve
+```
+
+---
+
+
 
 ## Provider Summary
 

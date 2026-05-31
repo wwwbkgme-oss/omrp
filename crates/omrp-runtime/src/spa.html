@@ -899,6 +899,7 @@ async function showUserDetail(uid, uname) {
 
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModal()">Close</button>
+      <button class="btn btn-secondary" style="color:var(--orange)" onclick="closeModal();resetUserKey('${uid}','${esc(uname)}')">↻ Reset Key</button>
       <button class="btn btn-primary" onclick="saveUserPermissions('${uid}')">Save Permissions</button>
     </div>`);
 }
@@ -1005,50 +1006,89 @@ async function renderRoles(ca) {
 }
 
 async function renderRouterKeys(ca) {
-  const {data:keys=[]} = await GET('/api/admin/api-keys');
-  const users = (await GET('/api/admin/users')).data || [];
-  const umap = Object.fromEntries(users.map(u=>[u.id, u.username]));
+  // 1 API key per user — show all users with their key status and permissions
+  const [{data:users=[]}, {data:keys=[]}] = await Promise.all([
+    GET('/api/admin/users'),
+    GET('/api/admin/api-keys'),
+  ]);
+  const keyByUser = Object.fromEntries(keys.map(k=>[k.user_id, k]));
+
   ca.innerHTML = `
     <div class="section-header">
-      <div><div class="section-title">Router API Keys</div><div class="section-sub">Clients use these to access the LLM proxy</div></div>
-      <button class="btn btn-primary" onclick="showCreateRKey()">+ Generate Key</button>
+      <div>
+        <div class="section-title">Router API Keys</div>
+        <div class="section-sub">One key per account — auto-generated at user creation · click <em>Reset</em> if a user lost their key</div>
+      </div>
     </div>
+
+    <!-- ── Info banner ── -->
+    <div style="background:var(--blue-dim);border:1px solid var(--blue)40;border-radius:var(--r8);padding:14px 18px;margin-bottom:16px;font-size:12px;color:var(--text1);line-height:1.7">
+      <strong style="color:var(--blue)">Key lifecycle:</strong><br>
+      • A key is <strong>auto-generated when an admin creates a user</strong> and shown once.<br>
+      • Users connect their tools with: <span class="mono" style="color:var(--cyan)">${location.origin}/v1</span> + their key.<br>
+      • If a user loses their key, use <strong>Reset</strong> — the old key is immediately deactivated and a new one is generated.<br>
+      • Permissions (proxy bypass, allowed models, rate limit) are managed via <em>Users → click row</em>.
+    </div>
+
     <div class="card"><div class="card-body" style="padding:0"><div class="tbl-wrap">
     <table>
-      <thead><tr><th>ID</th><th>Label</th><th>User</th><th>Prefix</th><th>Status</th><th>Last Used</th><th>Created</th><th></th></tr></thead>
-      <tbody>${keys.map(k=>`<tr>
-        <td><span class="mono" style="font-size:11px">${esc(k.id)}</span></td>
-        <td>${esc(k.label)}</td>
-        <td style="color:var(--text2);font-size:12px">${k.user_id ? esc(umap[k.user_id]||k.user_id) : '<em>global</em>'}</td>
-        <td><span class="mono">${esc(k.key_prefix)}…</span></td>
-        <td>${yesno(k.is_active)}</td>
-        <td style="color:var(--text2);font-size:12px">${fmtDatetime(k.last_used)}</td>
-        <td style="color:var(--text2);font-size:12px">${fmtDate(k.created_at)}</td>
-        <td>${k.is_active?`<button class="btn btn-danger" style="padding:4px 8px;font-size:11px" onclick="revokeKey('/api/admin/api-keys/${k.id}','rkeys')">Revoke</button>`:''}
-        </td>
-      </tr>`).join('')}
+      <thead><tr>
+        <th>User</th><th>Role</th><th>Key Prefix</th>
+        <th>Proxy Bypass</th><th>Router</th>
+        <th>Status</th><th>Last Used</th><th>Created</th><th></th>
+      </tr></thead>
+      <tbody>
+        ${users.map(u => {
+          const k = keyByUser[u.id];
+          const p = k ? (k.permissions || {}) : null;
+          return `<tr>
+            <td><span class="mono">${esc(u.username)}</span>
+              ${u.display_name ? `<br><span style="font-size:11px;color:var(--text2)">${esc(u.display_name)}</span>` : ''}
+            </td>
+            <td>${u.is_admin?'<span class="badge badge-purple">admin</span>':'<span class="badge badge-blue">user</span>'}</td>
+            <td>${k ? `<span class="mono" style="color:var(--cyan)">${esc(k.key_prefix)}…</span>` : '<span class="badge badge-red">no key</span>'}</td>
+            <td>${p ? (p.can_use_proxy_bypass ? '<span class="badge badge-green">✓</span>' : '<span class="badge badge-gray">✗</span>') : '—'}</td>
+            <td>${p ? (p.can_use_router !== false ? '<span class="badge badge-green">✓</span>' : '<span class="badge badge-red">✗</span>') : '—'}</td>
+            <td>${k ? yesno(k.is_active) : '<span style="color:var(--text3);font-size:12px">—</span>'}</td>
+            <td style="color:var(--text2);font-size:12px">${k ? fmtDatetime(k.last_used) : '—'}</td>
+            <td style="color:var(--text2);font-size:12px">${k ? fmtDate(k.created_at) : '—'}</td>
+            <td>
+              <button class="btn btn-secondary" style="padding:4px 10px;font-size:11px"
+                onclick="resetUserKey('${u.id}','${esc(u.username)}')">
+                ↻ Reset Key
+              </button>
+            </td>
+          </tr>`;
+        }).join('')}
       </tbody>
     </table>
     </div></div></div>`;
 }
 
-function showCreateRKey() {
+async function resetUserKey(uid, uname) {
+  if (!confirm(`Reset API key for "${uname}"?\n\nThe current key will stop working immediately.\nA new key will be generated and shown once.`)) return;
+  const r = await POST(`/api/admin/users/${uid}/key/reset`);
+  if (r.error) { toast(r.error.message, 'err'); return; }
+  // Show the new key
   openModal(`
-    <div class="modal-title">Generate Router API Key</div>
-    <div class="modal-sub">The key will be shown once. Copy it immediately.</div>
-    <div class="form-group"><label class="form-label">Label</label><input id="m-label" class="form-input" placeholder="Cursor, Claude Desktop…"></div>
+    <div class="modal-title" style="color:var(--green)">✓ New Key Generated</div>
+    <div class="modal-sub">User: <strong>${esc(uname)}</strong> · Old key deactivated immediately.</div>
+    <div class="key-box">
+      <span class="key-val" id="kval">${esc(r.api_key||'—')}</span>
+      <button class="btn btn-success" style="padding:6px 12px;font-size:12px" onclick="copyKey()">Copy</button>
+    </div>
+    <div class="key-note">⚠ Give this key to the user — it will NOT be shown again.</div>
+    <div style="margin-top:12px;font-size:12px;background:var(--bg3);border-radius:var(--r6);padding:10px">
+      <div style="color:var(--text2);margin-bottom:4px">Connection details to share with the user:</div>
+      <div class="mono" style="color:var(--cyan);font-size:11px">${location.origin}/v1</div>
+      <div class="mono" style="color:var(--text1);font-size:11px">${esc(r.api_key||'—')}</div>
+    </div>
     <div class="modal-footer">
-      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="createAdminKey()">Generate</button>
+      <button class="btn btn-primary" onclick="closeModal(); nav('rkeys')">Done</button>
     </div>`);
 }
 
-async function createAdminKey() {
-  const r = await POST('/api/admin/api-keys', {label: document.getElementById('m-label').value.trim()||'default'});
-  if (r.error) { toast(r.error.message,'err'); return; }
-  showKeyReveal(r.key, r.label, ()=>{ nav('rkeys'); });
-}
-
+// Legacy key reveal (still used by user creation flow)
 function showKeyReveal(key, label, onClose) {
   openModal(`
     <div class="modal-title" style="color:var(--green)">✓ Key Generated</div>
@@ -1141,25 +1181,46 @@ async function createPKey(endpoint, page, isAdmin) {
 
 async function renderSettings(ca) {
   const {data:settings=[]} = await GET('/api/admin/settings');
-  const EDITABLE = ['app.name','app.tagline','app.registration_open','proxy.enabled','proxy.refresh_interval','routing.default_tier','routing.fallback_count'];
+  // All settings the admin can configure via the web
+  const EDITABLE = [
+    'app.name','app.tagline','app.registration_open',
+    'proxy.enabled','proxy.source_url','proxy.refresh_interval',
+    'jwt.expiry_secs',
+    'routing.default_tier','routing.fallback_count',
+  ];
   const editable = settings.filter(s=>EDITABLE.includes(s.key));
   ca.innerHTML = `
     <div class="section-header">
-      <div><div class="section-title">System Settings</div><div class="section-sub">Configuration persisted in the database</div></div>
+      <div><div class="section-title">System Settings</div><div class="section-sub">All configuration is stored in the database — no file editing needed</div></div>
     </div>
     <div class="card"><div class="card-body">
     ${editable.map(s=>`
-      <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)18">
+      <div style="display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--border)18">
         <div style="flex:1">
-          <div style="font-weight:600;font-size:13px">${esc(s.key)}</div>
-          <div style="font-size:11px;color:var(--text2)">${esc(s.description)}</div>
+          <div style="font-weight:600;font-size:13px;font-family:var(--mono);color:var(--text0)">${esc(s.key)}</div>
+          <div style="font-size:11px;color:var(--text2);margin-top:2px">${esc(s.description)}</div>
         </div>
         <div style="display:flex;gap:8px;align-items:center">
-          <input class="form-input" id="sv-${s.key.replace(/\./g,'-')}" value="${esc(s.value)}" style="width:200px">
+          <input class="form-input" id="sv-${s.key.replace(/\./g,'-')}" value="${esc(s.value)}"
+            style="width:${s.key==='proxy.source_url'?'340px':'200px'}">
           <button class="btn btn-secondary" style="padding:6px 12px;font-size:12px" onclick="saveSetting('${s.key}')">Save</button>
         </div>
       </div>`).join('')}
-    </div></div>`;
+    </div></div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-header"><div class="card-title">What each setting does</div></div>
+      <div class="card-body" style="font-size:12px;color:var(--text1);line-height:2">
+        <code>app.name</code> — name shown in the browser tab and sidebar<br>
+        <code>app.registration_open</code> — <code>1</code> = users can self-register; <code>0</code> = admin creates all accounts<br>
+        <code>proxy.enabled</code> — <code>1</code> = proxy pool is active; users with bypass permission route through it<br>
+        <code>proxy.source_url</code> — where to fetch proxy IPs (ProxyScrape JSON/text endpoint)<br>
+        <code>proxy.refresh_interval</code> — how often (seconds) the pool auto-refreshes from the source URL<br>
+        <code>jwt.expiry_secs</code> — how long a login session stays valid (default 86400 = 24h)<br>
+        <code>routing.default_tier</code> — fallback tier when the classifier is unsure (<code>simple</code>/<code>medium</code>/<code>complex</code>/<code>reasoning</code>)<br>
+        <code>routing.fallback_count</code> — max models to try in the fallback chain per request
+      </div>
+    </div>`;
 }
 
 async function saveSetting(key) {
@@ -1354,20 +1415,51 @@ async function saveSettingVal(key, value) {
 async function renderModels(ca) {
   const {data:models=[]} = await GET('/v1/models');
   const real = (models||[]).filter(m=>!['auto','omrp/auto','omrp/auto-free'].includes(m.id));
+  // Group by provider
+  const byProv = {};
+  real.forEach(m => { (byProv[m.owned_by||'unknown'] ||= []).push(m); });
+
   ca.innerHTML = `
     <div class="section-header">
-      <div><div class="section-title">Registered Models</div><div class="section-sub">${real.length} from config</div></div>
+      <div><div class="section-title">Registered Models</div><div class="section-sub">${real.length} models across ${Object.keys(byProv).length} providers</div></div>
     </div>
-    <div class="card"><div class="card-body" style="padding:0"><div class="tbl-wrap">
-    <table>
-      <thead><tr><th>Model ID</th><th>Provider</th></tr></thead>
-      <tbody>${real.map(m=>`<tr>
-        <td><span class="mono">${esc(m.id)}</span></td>
-        <td>${provIcon(m.owned_by)} <span style="font-size:12px;color:var(--text2)">${esc(m.owned_by||'—')}</span></td>
-      </tr>`).join('')}
-      </tbody>
-    </table>
-    </div></div></div>`;
+
+    <!-- ── Note about model config ── -->
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r8);padding:14px 18px;margin-bottom:16px;font-size:12px;color:var(--text1);line-height:1.7">
+      <strong style="color:var(--text0)">How models are configured:</strong><br>
+      The model list comes from <code>~/.config/omrp/config.toml</code> on the server.
+      Run <code>omrp init</code> on the server to generate the default config (19 free models across 5 providers).<br>
+      <strong>Provider API keys</strong> are managed here on this page via
+      <strong>Admin → Provider Keys</strong> — no config file editing needed for keys.
+    </div>
+
+    <!-- ── Virtual models ── -->
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-header"><div class="card-title">Virtual Models (auto-routing)</div></div>
+      <div class="card-body" style="font-size:12px;color:var(--text1);line-height:1.8">
+        <div><span class="mono" style="color:var(--cyan)">omrp/auto</span> — Thompson Sampling picks the best available model for each request</div>
+        <div><span class="mono" style="color:var(--cyan)">omrp/auto-free</span> — same as above</div>
+        <div style="color:var(--text2);margin-top:4px">Use these model names in your tools (Cursor, Claude Desktop, etc.) for intelligent routing.</div>
+      </div>
+    </div>
+
+    <!-- ── Models by provider ── -->
+    ${Object.entries(byProv).map(([prov, ms]) => `
+    <div class="card" style="margin-bottom:10px">
+      <div class="card-header">
+        <div style="display:flex;align-items:center;gap:8px">${provIcon(prov)}<span class="card-title">${prov.toUpperCase()}</span>
+          <span class="badge badge-gray">${ms.length} model(s)</span>
+        </div>
+      </div>
+      <div class="card-body" style="padding:0"><div class="tbl-wrap"><table>
+        <thead><tr><th>Model ID</th><th>Tasks</th></tr></thead>
+        <tbody>${ms.map(m=>`<tr>
+          <td><span class="mono" style="font-size:12px">${esc(m.id)}</span></td>
+          <td style="color:var(--text2);font-size:11px">${esc((m.tasks||[]).join(', ')||'—')}</td>
+        </tr>`).join('')}
+        </tbody>
+      </table></div></div>
+    </div>`).join('')}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1470,34 +1562,66 @@ async function renderMyKeys(ca) {
 
 async function renderMyProviders(ca) {
   const {data:keys=[]} = await GET('/api/user/provider-keys');
+  const PROVIDERS = ['openrouter','kilo','cerebras','groq','buw'];
+  const byProv = Object.fromEntries(PROVIDERS.map(p => [p, keys.filter(k=>k.provider===p)]));
+
   ca.innerHTML = `
     <div class="section-header">
       <div><div class="section-title">My Provider Keys</div><div class="section-sub">Personal API keys for LLM providers</div></div>
       <button class="btn btn-primary" onclick="showCreatePKey(false)">+ Add Key</button>
     </div>
-    <div class="card"><div class="card-body" style="padding:0"><div class="tbl-wrap">
-    <table>
-      <thead><tr><th>Provider</th><th>Label</th><th>Status</th><th>Added</th><th></th></tr></thead>
-      <tbody>${keys.length ? keys.map(k=>`<tr>
-        <td>${provIcon(k.provider)} <span style="font-size:12px;color:var(--text1)">${esc(k.provider)}</span></td>
-        <td>${esc(k.label||'—')}</td>
-        <td>${yesno(k.is_active)}</td>
-        <td style="color:var(--text2);font-size:12px">${fmtDate(k.created_at)}</td>
-        <td>${(!k.is_global && k.is_active)?`<button class="btn btn-danger" style="padding:4px 8px;font-size:11px" onclick="revokeKey('/api/user/provider-keys/${k.id}','my-pkeys')">Remove</button>`:''}
-        </td>
-      </tr>`).join('') : `<tr><td colspan="5"><div class="empty"><div class="empty-icon">⊟</div><div class="empty-title">No provider keys</div><div class="empty-sub">Add your own API keys, or use the global keys configured by the admin.</div></div></td></tr>`}
-      </tbody>
-    </table>
-    </div></div></div>`;
+
+    <!-- ── Priority explanation ── -->
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r8);padding:14px 18px;margin-bottom:16px;font-size:12px;color:var(--text1);line-height:1.7">
+      <strong style="color:var(--text0)">Key resolution order for your requests:</strong><br>
+      1. <span style="color:var(--cyan)">Your personal key</span> (added here) for that provider<br>
+      2. <span style="color:var(--blue)">Global key</span> set by admin (available to all users)<br>
+      3. <span style="color:var(--text2)">Environment variable</span> on the server (fallback)<br>
+      Adding a personal key lets you use your own quota independently from other users.
+    </div>
+
+    <!-- ── Per-provider panels ── -->
+    ${PROVIDERS.map(p => {
+      const pk = byProv[p] || [];
+      const globalKeys = pk.filter(k=>k.is_global);
+      const myKeys     = pk.filter(k=>!k.is_global);
+      return `
+      <div class="card" style="margin-bottom:10px">
+        <div class="card-header">
+          <div style="display:flex;align-items:center;gap:8px">
+            ${provIcon(p)}<span class="card-title">${p.toUpperCase()}</span>
+            ${globalKeys.length ? '<span class="badge badge-blue" style="font-size:10px">global key active</span>' : ''}
+            ${myKeys.length ? '<span class="badge badge-green" style="font-size:10px">my key active</span>' : ''}
+          </div>
+        </div>
+        ${pk.length ? `
+        <div class="card-body" style="padding:0"><div class="tbl-wrap"><table>
+          <thead><tr><th>Label</th><th>Scope</th><th>Status</th><th>Added</th><th></th></tr></thead>
+          <tbody>${pk.map(k=>`<tr>
+            <td>${esc(k.label||'—')}</td>
+            <td>${k.is_global?'<span class="badge badge-blue">global</span>':'<span class="badge badge-green">mine</span>'}</td>
+            <td>${yesno(k.is_active)}</td>
+            <td style="color:var(--text2);font-size:12px">${fmtDate(k.created_at)}</td>
+            <td>${(!k.is_global && k.is_active)?`<button class="btn btn-danger" style="padding:4px 8px;font-size:11px" onclick="revokeKey('/api/user/provider-keys/${k.id}','my-pkeys')">Remove</button>`:''}
+            </td>
+          </tr>`).join('')}</tbody>
+        </table></div></div>` : `
+        <div class="card-body" style="padding:10px 18px;font-size:12px;color:var(--text2)">
+          No key — ${globalKeys.length ? 'global key from admin is active.' : 'add your own key or ask admin to add a global key.'}
+        </div>`}
+      </div>`;
+    }).join('')}`;
 }
 
 async function renderMyStats(ca) {
   const {daily=[]} = await GET('/api/user/stats');
   const total_req = daily.reduce((a,d)=>a+d.requests,0);
+  const total_err = daily.reduce((a,d)=>a+d.errors,0);
   const total_tok = daily.reduce((a,d)=>a+d.tokens,0);
   ca.innerHTML = `
     <div class="stats-grid">
       <div class="stat-card cyan"><div class="stat-value">${total_req}</div><div class="stat-label">Requests (30d)</div></div>
+      <div class="stat-card ${total_err>0?'':'green'}"><div class="stat-value" style="color:${total_err>0?'var(--red)':'var(--green)'}">${total_err}</div><div class="stat-label">Errors (30d)</div></div>
       <div class="stat-card blue"><div class="stat-value">${(total_tok/1000).toFixed(1)}k</div><div class="stat-label">Tokens (30d)</div></div>
     </div>
     <div class="card">
@@ -1510,33 +1634,58 @@ async function renderMyProfile(ca) {
   const user = await GET('/api/user/me');
   ca.innerHTML = `
     <div class="section-header">
-      <div><div class="section-title">Profile</div></div>
+      <div><div class="section-title">Profile</div><div class="section-sub">All changes take effect immediately</div></div>
     </div>
-    <div class="card" style="max-width:480px">
+    <div class="card" style="max-width:520px">
       <div class="card-body">
-        <div class="form-group"><label class="form-label">Username</label>
-          <input class="form-input" value="${esc(user.username||'')}" disabled></div>
+        <div class="form-group"><label class="form-label">Username <span style="color:var(--text3);font-size:11px">(cannot be changed)</span></label>
+          <input class="form-input" value="${esc(user.username||'')}" disabled style="opacity:.6"></div>
         <div class="form-group"><label class="form-label">Display Name</label>
-          <input class="form-input" value="${esc(user.display_name||'')}" disabled></div>
-        <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
-          <div class="form-group"><label class="form-label">New Password</label>
-            <input id="p-pw1" class="form-input" type="password" placeholder="Min 8 characters"></div>
+          <input id="p-dname" class="form-input" value="${esc(user.display_name||'')}">
+          <span class="form-hint">Shown in the sidebar and audit logs</span></div>
+        <div class="form-group"><label class="form-label">Email <span style="color:var(--text2);font-size:11px">(optional)</span></label>
+          <input id="p-email" class="form-input" type="email" value="${esc(user.email||'')}"></div>
+        <button class="btn btn-secondary" onclick="saveProfile()">Save Profile</button>
+        <div style="margin-top:22px;padding-top:16px;border-top:1px solid var(--border)">
+          <div style="font-weight:600;font-size:13px;margin-bottom:12px">Change Password</div>
+          <div class="form-group"><label class="form-label">New Password <span style="color:var(--text2);font-size:11px">(min 8 chars)</span></label>
+            <input id="p-pw1" class="form-input" type="password" placeholder="New password"></div>
           <div class="form-group"><label class="form-label">Confirm Password</label>
-            <input id="p-pw2" class="form-input" type="password" placeholder="Repeat password"></div>
-          <button class="btn btn-primary" style="margin-top:8px" onclick="changePassword()">Update Password</button>
+            <input id="p-pw2" class="form-input" type="password" placeholder="Repeat new password"></div>
+          <button class="btn btn-primary" onclick="changePassword()">Update Password</button>
+        </div>
+        <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--border);font-size:12px;color:var(--text2)">
+          Created: ${fmtDate(user.created_at)} &nbsp;·&nbsp;
+          Last login: ${fmtDatetime(user.last_login)} &nbsp;·&nbsp;
+          ${user.is_admin?'<span class="badge badge-purple">admin</span>':'<span class="badge badge-blue">user</span>'}
         </div>
       </div>
     </div>`;
 }
 
+async function saveProfile() {
+  const body = {};
+  const dn = document.getElementById('p-dname')?.value.trim();
+  const em = document.getElementById('p-email')?.value.trim();
+  if (dn !== undefined) body.display_name = dn;
+  if (em !== undefined) body.email = em || null;
+  const r = await PUT('/api/user/me', body);
+  if (r.error) toast(r.error.message,'err');
+  else { toast('Profile saved'); nav('my-profile'); }
+}
+
 async function changePassword() {
   const p1 = document.getElementById('p-pw1').value;
   const p2 = document.getElementById('p-pw2').value;
-  if (p1.length < 8) { toast('Password must be ≥ 8 chars','err'); return; }
+  if (p1.length < 8) { toast('Password ≥ 8 chars required','err'); return; }
   if (p1 !== p2) { toast('Passwords do not match','err'); return; }
   const r = await PUT('/api/user/me', { password: p1 });
   if (r.error) toast(r.error.message,'err');
-  else toast('Password updated');
+  else {
+    toast('Password updated');
+    document.getElementById('p-pw1').value = '';
+    document.getElementById('p-pw2').value = '';
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════

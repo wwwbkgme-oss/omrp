@@ -92,6 +92,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // ── Admin: per-user API key + permissions ─────────────────────────────
         .route("/api/admin/users/:id/key",             get(admin_get_user_key))
         .route("/api/admin/users/:id/key/permissions", put(admin_update_user_key_permissions))
+        .route("/api/admin/users/:id/key/reset",        post(admin_reset_user_key))
         // ── Admin: proxy usage stats ──────────────────────────────────────────
         .route("/api/admin/proxies/stats", get(admin_proxy_stats))
         // ── User: own key + permissions ────────────────────────────────────────
@@ -944,6 +945,50 @@ async fn admin_update_user_key_permissions(
                 Some(&perms.to_json()), None, ts,
             );
             ok(json!({ "status": "ok", "key_id": key.id, "permissions": perms }))
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `POST /api/admin/users/:id/key/reset`
+///
+/// Deactivates the user's current API key and generates a fresh one,
+/// preserving the existing permissions.  Use when a user has lost their key.
+/// The new raw key is returned in the response (shown once).
+async fn admin_reset_user_key(
+    State(state): State<Arc<AppState>>, user: AuthUser,
+    Path(uid): Path<String>,
+) -> Response {
+    if let Some(e) = require_admin(&user) { return e; }
+
+    // Get existing key to preserve permissions
+    let (old_id, perms) = match state.db.get_user_api_key(&uid) {
+        Ok(Some(k)) => (Some(k.id), ApiKeyPermissions::from_json(&k.permissions)),
+        Ok(None)    => (None, ApiKeyPermissions::default()),
+        Err(e)      => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    // Deactivate old key if it exists
+    if let Some(ref kid) = old_id {
+        let _ = state.db.deactivate_api_key(kid);
+    }
+
+    // Generate new key with same permissions
+    let ts = now_secs() as i64;
+    match state.db.create_user_api_key(&uid, "account-default", &perms) {
+        Ok((row, raw_key)) => {
+            let _ = state.db.audit(
+                Some(&user.user_id), "api_key.reset",
+                Some(&row.id), Some("api_key"), None, None, ts,
+            );
+            (StatusCode::CREATED, Json(json!({
+                "status":       "ok",
+                "new_key_id":   row.id,
+                "api_key":      raw_key,
+                "key_prefix":   row.key_prefix,
+                "permissions":  perms,
+                "note":         "Give this key to the user — it will not be shown again.",
+            }))).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }

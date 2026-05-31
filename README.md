@@ -1,5 +1,123 @@
 # OMRP — Open Model Routing Protocol
 
+> **Status:** v0.2.0 — multi-user web dashboard, 1-key-per-user API system, proxy bypass  
+> **Architecture:** Event-sourced, deterministic, Bayesian LLM routing engine
+
+```bash
+omrp serve --host 0.0.0.0 --port 18800   # start the multi-user web server
+```
+
+Open **http://localhost:18800** in your browser. The setup wizard creates
+the first admin account and shows your API key.
+
+---
+
+## Everything through the web
+
+**No terminal access is required for daily use.** After the initial server
+start, all configuration is done through the dashboard:
+
+| Who | Can do via web |
+|-----|---------------|
+| **Admin** | Create/manage users, set permissions per user, add global provider API keys, manage proxy pool, view all stats + audit logs, configure app settings |
+| **User** | View their API key + integration guide, add personal provider keys, view own usage stats, update profile/password |
+
+---
+
+## Quick Start
+
+```bash
+# 1. Start the server
+omrp serve --host 0.0.0.0 --port 18800
+
+# 2. Open browser → http://your-server:18800
+# 3. Complete the 4-step setup wizard
+# 4. Copy the admin API key (shown ONCE — save it!)
+# 5. Configure Cursor / Claude Desktop / Continue with:
+#      Base URL:  http://your-server:18800/v1
+#      API Key:   omrp-sk-<your key>
+#      Model:     omrp/auto
+```
+
+---
+
+## API Key System (1 key per user)
+
+Every account gets **exactly one** API key, auto-generated at account creation.
+The key carries fine-grained permissions set by the admin:
+
+| Permission | Description | Admin default | User default |
+|-----------|-------------|---------------|-------------|
+| `can_use_router` | Access `/v1/chat/completions` | `true` | `true` |
+| `can_use_proxy_bypass` | Route through proxy pool — **zero rate limits** | `true` | `false` |
+| `allowed_models` | Restrict to specific models | all | all |
+| `rate_limit_per_hour` | Request cap | unlimited | unlimited |
+
+To enable rate-limit bypass for a user: **Admin → Users → click user → Proxy Bypass → Save**.
+
+If a user loses their key: **Admin → Router Keys → Reset** (old key immediately deactivated, new key generated).
+
+---
+
+## Proxy Rate-Limit Bypass
+
+When `can_use_proxy_bypass = true`, **every** request from that user's key is
+routed through a rotating pool of proxy IPs — their real IP never reaches
+the LLM provider. Result: zero rate-limit errors.
+
+Manage the proxy pool: **Admin → Proxies → Enable → Refresh Pool Now**.
+
+---
+
+## What is OMRP routing?
+
+OMRP selects the best available model for each request using:
+- **Bayesian Agent Scoring** — 5-factor: Competence α/(α+β), Speed, Skill Match, Load, Stability
+- **Thompson Sampling** — probabilistic exploration balancing proven vs uncertain models
+- **Wilson Score Garbage Detection** — excludes consistently failing models
+- **SHA-256 Tamper-Evident Ledger** — every routing decision cryptographically chained
+
+---
+
+## CLI (advanced / server admin)
+
+```bash
+omrp route   [--task T] [--tier T] <prompt>   # one-shot routing
+omrp status                                    # model health scores
+omrp best <task>                               # best model for a task
+omrp init                                      # create default config file
+```
+
+---
+
+## Crates
+
+| Crate | Description |
+|-------|-------------|
+| `omrp-types` | Shared types: Model, TaskType, RoutingDecision |
+| `omrp-events` | Event enum, ErrorKind, validate() |
+| `omrp-core` | Routing kernel: State, dispatch(), Scorer, RouterEngine |
+| `omrp-runtime` | Web server + CLI binary |
+
+---
+
+## Documentation
+
+| File | Description |
+|------|-------------|
+| `docs/WEB.md` | REST API reference, key system, proxy bypass |
+| `docs/ROUTING.md` | Bayesian scoring, Thompson Sampling, Wilson Score |
+| `docs/DATABASE.md` | SQLite schema (12 tables) |
+| `docs/PROVIDERS.md` | All 5 LLM providers + setup |
+| `docs/ARCHITECTURE.md` | Crate graph, data flow, invariants |
+
+---
+
+## License
+
+MIT
+
+
 > **Status:** v0.2.0 — multi-user web app, SQLite persistence, BUW provider  
 > **Architecture:** Event-sourced, deterministic, replay-safe LLM routing engine
 

@@ -141,6 +141,7 @@ All `/api/admin/*` endpoints require `is_admin: true`.
 | `GET` | `/api/admin/users/:id/stats` | Per-user usage stats (30d daily breakdown) |
 | `GET` | `/api/admin/users/:id/key` | User's API key info + permissions |
 | `PUT` | `/api/admin/users/:id/key/permissions` | Update API key permissions |
+| `POST` | `/api/admin/users/:id/key/reset` | **Regenerate key** — deactivates old, creates new (use if user lost key) |
 
 **Create user response (key shown once):**
 ```json
