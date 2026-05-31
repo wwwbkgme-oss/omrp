@@ -140,17 +140,13 @@ pub async fn run(cfg: Config, host: &str, port: u16) {
     axum::serve(listener, app).await.unwrap();
 }
 
-// ─── SPA placeholder ──────────────────────────────────────────────────────────
-// (replaced with the full cyberpunk SPA in TODO #5)
+// ─── SPA (cyberpunk enterprise dashboard) ─────────────────────────────────────
+// Loaded from spa.html at compile time via include_str!
 
-async fn serve_spa(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let onboarding = onboarding_needed(&state.db);
-    Html(format!(
-        r#"<!DOCTYPE html><html><head><meta charset=UTF-8><title>OMRP</title>
-<meta http-equiv="refresh" content="0; url={}">
-</head><body>Loading…</body></html>"#,
-        if onboarding { "/setup" } else { "/#dashboard" }
-    ))
+static SPA_HTML: &str = include_str!("spa.html");
+
+async fn serve_spa(_state: State<Arc<AppState>>) -> impl IntoResponse {
+    Html(SPA_HTML)
 }
 
 // ─── Auth handlers ────────────────────────────────────────────────────────────
