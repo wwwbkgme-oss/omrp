@@ -14,7 +14,10 @@ omrp serve --host 0.0.0.0 --port 8080
 ```
 
 On first run the server detects that no users exist and the SPA shows an
-onboarding wizard to create the admin account.
+**onboarding wizard** that:
+1. Creates the admin account
+2. Sets the application name
+3. Shows the admin's **API key once** — copy it and store it securely
 
 ---
 
@@ -41,7 +44,8 @@ The server also sets `Set-Cookie: omrp_token=<jwt>; HttpOnly; SameSite=Lax`.
 Every protected endpoint requires **one** of:
 1. `Authorization: Bearer <jwt>` header
 2. `omrp_token` cookie (set automatically on login)
-3. `Authorization: Bearer omrp-sk-<64hex>` (router API key)
+3. `Authorization: Bearer omrp-sk-<64hex>` (router API key — the primary
+   way external tools authenticate)
 
 ### Logout
 
@@ -60,6 +64,36 @@ Authorization: Bearer <token>
 
 ---
 
+## API Key System
+
+### One key per account
+
+Every user account has **exactly one** API key, automatically generated
+when the account is created.  The raw key is shown **once** and never
+again.  No additional keys can be generated.
+
+The API key carries **fine-grained permissions** (set/changed by admin):
+
+| Permission | Default (user) | Default (admin) |
+|-----------|----------------|-----------------|
+| `can_use_router` | `true` | `true` |
+| `can_use_proxy_bypass` | `false` | `true` |
+| `allowed_models` | `[]` (all) | `[]` (all) |
+| `rate_limit_per_hour` | `0` (unlimited) | `0` (unlimited) |
+
+### Proxy bypass permission
+
+When `can_use_proxy_bypass = true`:
+- **Every** request from this key is routed through the proxy pool
+  from the start — the user's real IP never reaches the LLM provider
+- Zero rate limit issues (each request uses a different proxy IP)
+- Admin enables this per-user in: Dashboard → Users → click user → Permissions
+
+When `can_use_proxy_bypass = false`:
+- Requests go direct — standard rate limits apply
+
+---
+
 ## Onboarding / Setup
 
 ```http
@@ -75,246 +109,156 @@ Content-Type: application/json
   "username":     "admin",
   "password":     "min8chars",
   "display_name": "Administrator",   // optional
-  "app_name":     "OMRP"            // optional
+  "app_name":     "OMRP"             // optional
 }
 ```
 
-Only works when `onboarding_needed == true` (no users exist yet).
+**Response (includes admin API key — save immediately):**
+```json
+{
+  "status":   "ok",
+  "user_id":  "uuid",
+  "api_key":  "omrp-sk-<64hex>",
+  "message":  "Admin account created. Save your API key — it will not be shown again."
+}
+```
 
 ---
 
 ## Admin Endpoints
 
-All `/api/admin/*` endpoints require a valid JWT with `is_admin: true`.
+All `/api/admin/*` endpoints require `is_admin: true`.
 
 ### Users
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/admin/users` | List all users |
-| `POST` | `/api/admin/users` | Create user |
-| `PUT` | `/api/admin/users/:id` | Update user (password, is_active) |
-| `DELETE` | `/api/admin/users/:id` | Delete user (cannot delete yourself) |
+| `GET` | `/api/admin/users` | List all users (includes last_login, created_at) |
+| `POST` | `/api/admin/users` | Create user + auto-generate API key |
+| `PUT` | `/api/admin/users/:id` | Update user (password, is_active, display_name, email) |
+| `DELETE` | `/api/admin/users/:id` | Delete user |
 | `PUT` | `/api/admin/users/:id/roles` | Replace user's roles |
+| `GET` | `/api/admin/users/:id/stats` | Per-user usage stats (30d daily breakdown) |
+| `GET` | `/api/admin/users/:id/key` | User's API key info + permissions |
+| `PUT` | `/api/admin/users/:id/key/permissions` | Update API key permissions |
 
-**Create user body:**
+**Create user response (key shown once):**
 ```json
 {
-  "username": "alice",
-  "password": "min8chars",
-  "display_name": "Alice",  // optional
-  "is_admin": false          // optional, default false
+  "id": "uuid", "username": "alice",
+  "api_key": "omrp-sk-<64hex>",
+  "note": "Share this key with the user — it will not be shown again."
 }
 ```
 
-### Roles
+**Update permissions:**
+```json
+{
+  "can_use_router":       true,
+  "can_use_proxy_bypass": true,
+  "allowed_models":       ["openrouter/claude-3-5-sonnet"],
+  "rate_limit_per_hour":  100
+}
+```
+
+### Roles & Settings
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/admin/roles` | List built-in roles |
+| `GET` | `/api/admin/settings` | List all system settings |
+| `PUT` | `/api/admin/settings/:key` | Update a setting |
 
-Built-in roles: `role_admin` (full access), `role_user` (user-scoped access).
-
-### Router API Keys
-
-Keys that external tools (Cursor, Claude Desktop, Continue, etc.) use to
-authenticate against the OMRP proxy.
+### Router & Provider Keys
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/admin/api-keys` | List all API keys |
-| `POST` | `/api/admin/api-keys` | Generate new key (returned once) |
-| `DELETE` | `/api/admin/api-keys/:id` | Revoke key |
-
-**Generate body:**
-```json
-{ "label": "Cursor", "user_id": "uuid" }  // user_id optional
-```
-
-**Response (key shown once):**
-```json
-{
-  "id":      "omrp_abc12345",
-  "key":     "omrp-sk-<64hex>",
-  "label":   "Cursor",
-  "created_at": 1748000000,
-  "note":    "Copy this key — it will not be shown again."
-}
-```
-
-### Provider API Keys
-
-Credentials for LLM providers (OpenRouter, Kilo, Cerebras, Groq, BUW).
-DB keys take priority over environment variables.
-
-| Method | Path | Description |
-|--------|------|-------------|
+| `DELETE` | `/api/admin/api-keys/:id` | Revoke key (emergency only) |
 | `GET` | `/api/admin/provider-keys` | List all provider keys |
 | `POST` | `/api/admin/provider-keys` | Add provider key |
 | `DELETE` | `/api/admin/provider-keys/:id` | Remove provider key |
 
-**Add body:**
-```json
-{
-  "provider":  "openrouter",
-  "key_value": "sk-or-...",
-  "label":     "Primary",
-  "is_global": true,          // true = available to all users
-  "user_id":   null           // optional: scope to one user
-}
-```
-
-### Settings
+### Stats & Analytics
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/admin/settings` | List all system settings |
-| `PUT` | `/api/admin/settings/:key` | Update a setting |
-
-**Update body:**
-```json
-{ "value": "MyOMRP" }
-```
-
-**Configurable settings:**
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `app.name` | `OMRP` | Application display name |
-| `app.tagline` | `Open Model Routing Protocol` | Tagline shown in UI |
-| `app.registration_open` | `0` | `1` = allow public self-registration |
-| `proxy.enabled` | `0` | `1` = route LLM calls through proxy pool |
-| `proxy.refresh_interval` | `3600` | Proxy list refresh (seconds) |
-| `proxy.source_url` | ProxyScrape URL | API URL for proxy list |
-| `jwt.expiry_secs` | `86400` | JWT token lifetime (seconds) |
-| `routing.default_tier` | `medium` | Default prompt tier |
-| `routing.fallback_count` | `3` | Max fallback models per request |
-
-### Statistics & Logs
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/admin/stats` | Usage stats (30 days), user count, key count, proxy count |
+| `GET` | `/api/admin/stats` | Usage stats (30d), user count, key count, proxy count |
 | `GET` | `/api/admin/audit-logs` | Last 100 audit log entries |
+| `GET` | `/api/admin/models/health` | Full Bayesian health profile per model |
+| `GET` | `/api/admin/routing/stats` | Ledger events, completions, failures, top models |
 
 ### Proxy Pool
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/admin/proxies` | List active proxies |
+| `GET` | `/api/admin/proxies/stats` | Per-proxy usage stats (total, success%, users, last_used) |
 | `POST` | `/api/admin/proxies/refresh` | Trigger background refresh from ProxyScrape |
 
 ---
 
 ## User Endpoints
 
-All `/api/user/*` endpoints require a valid JWT (any role).
-
-### Personal API Keys
+### Key & Permissions
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/user/api-keys` | List own API keys |
-| `POST` | `/api/user/api-keys` | Generate own key |
-| `DELETE` | `/api/user/api-keys/:id` | Revoke own key |
+| `GET` | `/api/user/key` | Own key info (prefix, is_active, permissions) |
+| `GET` | `/api/user/permissions` | Own permissions object |
 
-### Personal Provider Keys
+### Provider Keys
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/user/provider-keys` | List own + global provider keys |
+| `GET` | `/api/user/provider-keys` | Own + global provider keys |
 | `POST` | `/api/user/provider-keys` | Add personal provider key |
 | `DELETE` | `/api/user/provider-keys/:id` | Remove own provider key |
 
-### Profile & Stats
+### Stats & Profile
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/user/me` | Own profile |
-| `PUT` | `/api/user/me` | Update password |
+| `PUT` | `/api/user/me` | Update password, display_name, email |
 | `GET` | `/api/user/stats` | Own usage stats (30 days) |
 
 ---
 
 ## OpenAI-Compatible Proxy
 
-The proxy endpoint is compatible with any OpenAI client.  Just change the
-`base_url` to `http://localhost:18800/v1` and set the API key to an
-`omrp-sk-…` token (or leave empty if no keys are configured).
-
 ```bash
 curl http://localhost:18800/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer omrp-sk-<your-key>" \
-  -d '{
-    "model": "omrp/auto",
-    "messages": [{"role":"user","content":"write a fibonacci in Rust"}]
-  }'
+  -d '{ "model": "omrp/auto", "messages": [{"role":"user","content":"hello"}] }'
 ```
 
-### Endpoint
+### Permission enforcement
 
-```http
-POST /v1/chat/completions
-POST /chat/completions      (alias)
-```
+| Check | Condition | Error |
+|-------|-----------|-------|
+| Router access | `can_use_router = false` | 403 Forbidden |
+| Model allow-list | Model not in `allowed_models` | 403 Forbidden |
+| Auth required | Keys exist but no Bearer token | 401 Unauthorized |
+
+### Proxy bypass behaviour
+
+- `can_use_proxy_bypass = true`: request routed through proxy pool **from the first attempt** — no direct IP
+- `can_use_proxy_bypass = false`: direct only — standard provider rate limits apply
 
 ### Special model names
 
 | Model | Behaviour |
 |-------|-----------|
-| `omrp/auto` | OMRP selects best model via Thompson Sampling |
+| `omrp/auto` | Thompson Sampling routing |
 | `omrp/auto-free` | Same as above |
 | `auto` | Same as above |
-| Any registered model ID | Route directly to that model |
+| Any registered model ID | Direct to that model |
 
-### Auth behaviour
+### GET /v1/models
 
-- If **no API keys** are configured: all requests accepted (open mode)
-- If **any key exists**: `Authorization: Bearer omrp-sk-…` required
-
-### Request routing flow
-
-```
-POST /v1/chat/completions
-  │
-  ├─ Auth check (omrp-sk- key → SHA-256 lookup in api_keys table
-  │              JWT token   → validate signature)
-  │
-  ├─ Parse body: model, messages, max_tokens, stream
-  │
-  ├─ Is model "auto"?
-  │   ├─ YES: classify prompt → tier → select_thompson() → routed_model
-  │   └─ NO:  use requested model directly
-  │
-  ├─ Resolve provider API key:
-  │   1. DB (user's personal key for this provider)
-  │   2. DB (global key for this provider)
-  │   3. Environment variable (PROVIDER_API_KEY)
-  │
-  ├─ spawn_blocking: CompatClient → POST /chat/completions to provider
-  │
-  ├─ Log request to request_logs table
-  │
-  └─ Return response + X-OMRP-Model + X-OMRP-Tier headers
-```
-
-### Response headers
-
-| Header | Value |
-|--------|-------|
-| `X-OMRP-Model` | Actual model used (may differ from requested if auto-routed) |
-| `X-OMRP-Tier` | Routing tier (`simple`, `medium`, `complex`, `reasoning`, `explicit`) |
-
-### List models
-
-```http
-GET /v1/models
-GET /models     (alias)
-```
-
-Returns OpenAI-format model list including `omrp/auto`, `omrp/auto-free`,
-and all models from the config file.
+Returns OpenAI-format model list including virtual models and all registered models.
 
 ---
 
@@ -327,34 +271,17 @@ GET /stats    → { "proxy_count":N, "user_count":N, "version":"0.2.0" }
 
 ---
 
-## Tool Configuration Examples
+## Tool Configuration
 
-### Cursor
+| Tool | Base URL | API Key field | Model |
+|------|----------|--------------|-------|
+| Cursor | `http://localhost:18800/v1` | Settings → Models → API Key | `omrp/auto` |
+| Claude Desktop | `http://localhost:18800/v1` | `apiKey` in config | `omrp/auto` |
+| Continue | `http://localhost:18800/v1` | `apiKey` | `omrp/auto` |
+| Open WebUI | `http://localhost:18800/v1` | Admin → Connections | `omrp/auto` |
+| Any OpenAI SDK | `http://localhost:18800/v1` | `api_key=` | `omrp/auto` |
 
-- **Base URL**: `http://localhost:18800/v1`
-- **API Key**: `omrp-sk-<your-key>` (generate in dashboard)
-- **Model**: `omrp/auto` (auto-routing) or any registered model ID
+The user dashboard (My API Key page) shows these instructions automatically
+with the correct server URL and key prefix for reference.
 
-### Claude Desktop
 
-```json
-{
-  "mcpServers": {},
-  "apiKey": "omrp-sk-<your-key>",
-  "baseURL": "http://localhost:18800/v1"
-}
-```
-
-### Continue (VS Code extension)
-
-```json
-{
-  "models": [{
-    "title": "OMRP Auto",
-    "provider": "openai",
-    "model": "omrp/auto",
-    "apiBase": "http://localhost:18800/v1",
-    "apiKey": "omrp-sk-<your-key>"
-  }]
-}
-```

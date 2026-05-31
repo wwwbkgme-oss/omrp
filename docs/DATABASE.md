@@ -107,25 +107,61 @@ Seeded:
 
 ---
 
-### `api_keys`
+### `api_keys` (v0.2 — updated)
 
-Router API keys — used by external tools to authenticate against the OMRP
-proxy.  Only the SHA-256 hash of the raw key is stored; the raw key is
-shown once on creation and never again.
+Router API keys — one per user account, auto-generated at creation.
+The raw key is shown **once** and never stored; only the SHA-256 hash is kept.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | `id` | `TEXT PK` | e.g. `omrp_abc12345` |
-| `user_id` | `TEXT` | → `users(id)` ON DELETE CASCADE, NULL = global |
+| `user_id` | `TEXT UNIQUE` | → `users(id)` ON DELETE CASCADE; UNIQUE enforces 1-key-per-user |
 | `key_hash` | `TEXT NOT NULL` | SHA-256 hex of `omrp-sk-<64hex>` |
-| `key_prefix` | `TEXT NOT NULL` | First 16 chars (display only) |
-| `label` | `TEXT NOT NULL DEFAULT 'default'` | Human label |
+| `key_prefix` | `TEXT NOT NULL` | First 16 chars for display |
+| `label` | `TEXT NOT NULL DEFAULT 'default'` | |
 | `is_active` | `INTEGER NOT NULL DEFAULT 1` | 0 = revoked |
 | `created_at` | `INTEGER NOT NULL` | |
 | `last_used` | `INTEGER` | Updated on each authenticated request |
 | `expires_at` | `INTEGER` | NULL = no expiry |
+| `permissions` | `TEXT NOT NULL DEFAULT '{}'` | **JSON `ApiKeyPermissions`** |
 
-Indexes: `idx_api_keys_user(user_id)`, `idx_api_keys_hash(key_hash)`.
+**`ApiKeyPermissions` JSON schema:**
+```json
+{
+  "can_use_router":       true,
+  "can_use_proxy_bypass": false,
+  "allowed_models":       [],
+  "rate_limit_per_hour":  0
+}
+```
+
+- `can_use_router`: gates access to `/v1/chat/completions`
+- `can_use_proxy_bypass`: when `true`, routes through proxy pool on every request (no rate limits)
+- `allowed_models`: empty = all models; otherwise restrict to listed IDs
+- `rate_limit_per_hour`: 0 = unlimited
+
+Admin default: `proxy_bypass=true`. User default: `proxy_bypass=false`.
+
+---
+
+### `proxy_requests` (v0.2 — new)
+
+Tracks every LLM request with the proxy IP used. Enables per-proxy analytics.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | `INTEGER PK AUTOINCREMENT` | |
+| `proxy_id` | `INTEGER` | NULL = direct (no proxy) |
+| `proxy_url` | `TEXT` | URL at time of request (kept if proxy later deleted) |
+| `model_id` | `TEXT NOT NULL` | |
+| `provider` | `TEXT NOT NULL` | |
+| `user_id` | `TEXT` | |
+| `api_key_id` | `TEXT` | |
+| `success` | `INTEGER NOT NULL DEFAULT 1` | |
+| `latency_ms` | `INTEGER NOT NULL DEFAULT 0` | |
+| `created_at` | `INTEGER NOT NULL` | |
+
+Indexes: `idx_prx_proxy(proxy_id)`, `idx_prx_user(user_id)`, `idx_prx_created(created_at DESC)`.
 
 ---
 

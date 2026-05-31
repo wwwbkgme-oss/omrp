@@ -52,68 +52,53 @@ cargo run -p omrp-runtime -- best code
 ## Phase 4 — Web Application ✅ Complete (v0.2)
 
 ### 4-A  Multi-user dashboard ✅
-
-- Axum web server at `omrp serve --host H --port N`
-- JWT auth (Argon2id + HS256), cookie + Bearer header
-- Admin dashboard: users, roles, API keys, provider keys, settings, audit logs
-- User dashboard: personal keys, provider keys, usage stats, profile
-- Cyberpunk enterprise SPA (zero external JS deps, 55kb)
+- Axum web server, JWT auth (Argon2id + HS256), CORS
+- Admin: playground, routing intel, users+permissions, API keys, provider keys, settings, audit logs
+- User: my key+permissions, my providers, usage stats, profile
+- Cyberpunk enterprise SPA (~75kb, zero external JS deps)
+- Admin view-as-user toggle, click-to-detail on every user row
 
 ### 4-B  SQLite persistence ✅
+- 12-table schema: +  +  (v0.2)
 
-- 11-table schema: users, roles, permissions, api_keys, provider_keys,
-  settings, audit_logs, request_logs, proxies
-- Full CRUD layer in `src/db.rs`
+### 4-C  Onboarding wizard ✅ (4 steps)
+- Step 2: admin API key shown once with copy button + integration snippet
 
-### 4-C  Onboarding wizard ✅
+### 4-D  API key system (v0.2 redesigned) ✅
+- 1 API key per user, auto-generated at account creation
+- Fine-grained permissions: can_use_router, can_use_proxy_bypass, allowed_models, rate_limit_per_hour
+- Admin default: proxy_bypass=true; User default: proxy_bypass=false
 
-- First-run detection (`/api/setup/status`)
-- 3-step wizard in SPA: admin account → app name → done
+### 4-E  Proxy pool ✅ (v0.2 enhanced)
+- proxy_requests table tracks every proxied call (all-time per-proxy stats)
+- Admin-only management; users get bypass via key permissions
+- can_use_proxy_bypass=true: direct never used, proxy from first request
 
-### 4-D  API key system ✅
-
-- Router keys (`omrp-sk-…`) for external tools (Cursor, Claude Desktop, Continue)
-- Provider keys in DB (override env vars)
-- Per-user and global scope
-
-### 4-E  Proxy pool ✅
-
-- ProxyScrape API integration (JSON + plain-text)
-- SQLite-backed pool with health tracking
-- Background refresh via `/api/admin/proxies/refresh`
+### 4-F  Permission enforcement ✅
+- Router access gate, model allow-list, proxy bypass routing
 
 ---
 
 ## Phase 5 — Bayesian Routing ✅ Complete (v0.2)
 
 ### 5-A  Bayesian Agent Scoring ✅
-
-- `HealthStatus` gains `success_count` (α) and `failure_count` (β)
-- `bayesian_competence()` = α/(α+β) replaces EMA ratio in scorer
-- `stability_score()` = inverse Beta variance (replaces binary last-event check)
+- HealthStatus gains success_count (α) + failure_count (β)
+- bayesian_competence() = α/(α+β), stability = inverse Beta variance
+- Full Bayesian profile via /api/admin/models/health
 
 ### 5-B  Thompson Sampling ✅
-
-- `RouterEngine::select_thompson()` — probabilistic exploration
-- Beta(α,β) sampled via Gamma ratio (Marsaglia-Tsang, no external deps)
-- Xorshift64 PRNG seeded from ledger sequence
-- `select()` remains fully deterministic (CLI unchanged)
+- RouterEngine::select_thompson() — Gamma ratio sampler, Xorshift64 RNG
+- omrp serve uses Thompson Sampling for production routing
+- Routing Intelligence dashboard shows seed, selected model, all 5 scores
 
 ### 5-C  Wilson Score Garbage Detection ✅
-
-- Replaces `success_ratio < 0.2` with Wilson Score lower bound (95% CI)
-- Minimum 5 observations before garbage classification
-- More principled: accounts for sample size uncertainty
+- 95% CI lower bound, min 5 observations before exclusion
 
 ---
 
-## Phase 6 — CI/CD ✅ Complete
-
-- GitHub Actions CI: `cargo build`, `cargo test`, `cargo clippy`
-- Format check (advisory) — codebase uses column-aligned style
+## Phase 6 — CI ✅ Complete
 
 ---
-
 ## Backlog
 
 ### Health Probes
