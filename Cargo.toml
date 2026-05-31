@@ -21,7 +21,7 @@ toml = "0.8"
 dirs = "5"
 ratatui = "0.29"
 crossterm = "0.28"
-tiny_http = "0.12"
+# tiny_http removed — server.rs was deleted; axum is the sole HTTP layer
 
 # ── New: async runtime + web framework ────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }

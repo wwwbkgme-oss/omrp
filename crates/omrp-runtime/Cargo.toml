@@ -20,7 +20,7 @@ toml.workspace       = true
 dirs.workspace       = true
 ratatui.workspace    = true
 crossterm.workspace  = true
-tiny_http.workspace  = true
+# tiny_http removed — server.rs deleted; axum is the sole HTTP layer
 
 # async runtime + web
 tokio.workspace      = true

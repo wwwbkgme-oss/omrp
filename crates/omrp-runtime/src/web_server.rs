@@ -18,7 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, Request, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
+    middleware,
     response::{Html, IntoResponse, Json, Response},
     routing::{delete, get, post, put},
     Router,
@@ -36,7 +37,7 @@ use crate::auth::{
     sha256_hex, AppState, AuthUser, LoginRequest, MaybeAuthUser,
 };
 use crate::config::Config;
-use crate::db::{ApiKeyPermissions, ApiKeyRow, Database, ProviderKeyRow, UserRow};
+use crate::db::{ApiKeyPermissions, ApiKeyRow, Database, MAX_FAILED_LOGINS, ProviderKeyRow, UserRow};
 use crate::routing::{bootstrap_pipeline, select_for_tier, tier_model_ids};
 use crate::validation::{
     validate_allowed_models, validate_api_key_value, validate_display_name,
@@ -54,6 +55,49 @@ fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
 
 fn ok(body: Value) -> Response {
     Json(body).into_response()
+}
+
+// ─── Security headers middleware ──────────────────────────────────────────────
+//
+// Applied to every response via .layer(middleware::from_fn(security_headers)).
+// These headers harden the SPA against common web attacks:
+//
+//  X-Frame-Options            — prevent clickjacking (older browsers)
+//  X-Content-Type-Options     — prevent MIME-type sniffing
+//  Referrer-Policy            — limit referrer info sent cross-origin
+//  X-XSS-Protection           — disable legacy XSS auditor (causes issues)
+//  Permissions-Policy         — restrict powerful browser APIs
+//  Content-Security-Policy    — inline-friendly policy for the monolithic SPA:
+//    default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'
+//    'unsafe-inline'; img-src 'self' data:; connect-src 'self';
+//    frame-ancestors 'none'; base-uri 'self'; form-action 'self'
+
+const SEC_HEADERS: &[(&str, &str)] = &[
+    ("x-frame-options",          "DENY"),
+    ("x-content-type-options",   "nosniff"),
+    ("referrer-policy",          "strict-origin-when-cross-origin"),
+    ("x-xss-protection",         "0"),
+    ("permissions-policy",       "camera=(), microphone=(), geolocation=()"),
+    ("content-security-policy",
+        "default-src 'self'; \
+         script-src 'self' 'unsafe-inline'; \
+         style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; \
+         connect-src 'self'; \
+         frame-ancestors 'none'; \
+         base-uri 'self'; \
+         form-action 'self'"),
+];
+
+async fn security_headers_mw(req: Request<Body>, next: middleware::Next) -> Response {
+    let mut resp = next.run(req).await;
+    let hdrs = resp.headers_mut();
+    for (name, value) in SEC_HEADERS {
+        let n = HeaderName::from_static(name);
+        let v = HeaderValue::from_static(value);
+        hdrs.entry(n).or_insert(v);
+    }
+    resp
 }
 
 // ─── Router ───────────────────────────────────────────────────────────────────
@@ -129,6 +173,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/stats",  get(server_stats))
         .with_state(state)
+        .layer(middleware::from_fn(security_headers_mw))
         .layer(cors)
 }
 
@@ -248,8 +293,6 @@ async fn auth_login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
 ) -> Response {
-    use crate::db::MAX_FAILED_LOGINS;
-
     // ── Brute-force guard ──────────────────────────────────────────────────────
     // Check BEFORE running Argon2 to prevent both enumeration and CPU exhaustion.
     if let Ok(Some(secs)) = state.db.login_lockout_secs(&req.username) {
