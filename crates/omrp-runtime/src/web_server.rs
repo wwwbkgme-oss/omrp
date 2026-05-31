@@ -115,9 +115,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/",          get(serve_spa))
         .route("/setup",     get(serve_spa))
         // ── Auth ─────────────────────────────────────────────────────────────
-        .route("/api/auth/login",   post(auth_login))
-        .route("/api/auth/logout",  post(auth_logout))
-        .route("/api/auth/me",      get(auth_me))
+        .route("/api/auth/login",    post(auth_login))
+        .route("/api/auth/logout",   post(auth_logout))
+        .route("/api/auth/me",       get(auth_me))
+        .route("/api/auth/register", post(auth_register))
         // ── Onboarding ───────────────────────────────────────────────────────
         .route("/api/setup",        post(setup_init))
         .route("/api/setup/status", get(setup_status))
@@ -348,10 +349,113 @@ async fn auth_me(user: AuthUser) -> Response {
     }))
 }
 
-// ─── Onboarding / setup handlers ─────────────────────────────────────────────
+// ─── Public self-registration ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    username:     String,
+    password:     String,
+    display_name: Option<String>,
+    email:        Option<String>,
+}
+
+/// Public self-registration endpoint.
+///
+/// Only active when the `app.registration_open` DB setting is `"1"`.
+/// Creates a non-admin account with default API key permissions and
+/// returns a JWT (same shape as `/api/auth/login`).
+async fn auth_register(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterRequest>,
+) -> Response {
+    // Check feature flag — default off
+    let open = state.db.get_setting("app.registration_open")
+        .ok().flatten().as_deref() == Some("1");
+    if !open {
+        return err(StatusCode::FORBIDDEN,
+            "Registration is closed. Contact an administrator to create an account.");
+    }
+    // Validate inputs
+    if let Err(e) = validate_username(req.username.trim()) { return err(StatusCode::BAD_REQUEST, e); }
+    if let Err(e) = validate_password(&req.password)       { return err(StatusCode::BAD_REQUEST, e); }
+    if let Err(e) = validate_display_name(req.display_name.as_deref().unwrap_or("")) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    if let Err(e) = validate_email(req.email.as_deref().unwrap_or("")) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    // Hash password and create user
+    let hash = match hash_password(&req.password) {
+        Ok(h) => h,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let ts  = now_secs() as i64;
+    let uid = Uuid::new_v4().to_string();
+    let row = UserRow {
+        id: uid.clone(),
+        username:      req.username.trim().to_string(),
+        email:         req.email,
+        password_hash: hash,
+        display_name:  req.display_name.unwrap_or_default(),
+        is_active:     true,
+        is_admin:      false,  // self-registered users are never admins
+        created_at:    ts,
+        updated_at:    ts,
+        last_login:    None,
+    };
+    if let Err(e) = state.db.insert_user(&row) {
+        let msg = e.to_string();
+        if msg.contains("UNIQUE") {
+            return err(StatusCode::CONFLICT, "Username is already taken");
+        }
+        return err(StatusCode::INTERNAL_SERVER_ERROR, msg);
+    }
+    // Auto-generate an API key for the new user
+    let key_plain = generate_api_key();
+    let key_hash  = sha256_hex(&key_plain);
+    let prefix    = key_plain.chars().take(16).collect::<String>();
+    let _ = state.db.insert_api_key(&ApiKeyRow {
+        id:          generate_key_id(),
+        user_id:     Some(uid.clone()),
+        key_hash,
+        key_prefix:  prefix,
+        label:       "Default".into(),
+        is_active:   true,
+        permissions: "{}".into(),
+        created_at:  ts,
+        last_used:   None,
+        expires_at:  None,
+    });
+    // Audit log
+    let _ = state.db.audit(Some(&uid), "auth.register", None, None, None, None, ts);
+    // Issue JWT and log the user in
+    let expiry: u64 = state.db.get_setting("jwt.expiry_secs").ok().flatten()
+        .and_then(|s| s.parse().ok()).unwrap_or(86400);
+    match crate::auth::authenticate(&state.db, &row.username, &req.password,
+        &state.jwt_secret, expiry) {
+        Ok(resp) => {
+            let cookie = auth_cookie(&resp.token, expiry);
+            let mut headers = HeaderMap::new();
+            if let Ok(v) = cookie.parse::<HeaderValue>() { headers.insert("Set-Cookie", v); }
+            (StatusCode::CREATED, headers, Json(json!({
+                "token":    resp.token,
+                "user_id":  resp.user_id,
+                "username": resp.username,
+                "is_admin": false,
+                "api_key":  key_plain,
+            }))).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
 
 async fn setup_status(State(state): State<Arc<AppState>>) -> Response {
-    ok(json!({ "onboarding_needed": onboarding_needed(&state.db) }))
+    let reg_open = state.db.get_setting("app.registration_open")
+        .ok().flatten().as_deref() == Some("1");
+    ok(json!({
+        "onboarding_needed":   onboarding_needed(&state.db),
+        "registration_open":   reg_open,
+    }))
 }
 
 #[derive(Deserialize)]

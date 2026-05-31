@@ -241,7 +241,37 @@ tbody td{padding:10px 14px;font-size:13px;color:var(--text1);vertical-align:midd
       <input id="l-pass" class="form-input" type="password" placeholder="••••••••" autocomplete="current-password">
     </div>
     <button class="btn btn-primary btn-full" onclick="doLogin()">Sign In</button>
+    <div id="login-reg-link" style="display:none;text-align:center;margin-top:12px">
+      <span style="font-size:12px;color:var(--text2)">No account?
+        <a href="#" onclick="showRegister();return false" style="color:var(--accent)">Create one</a>
+      </span>
+    </div>
     <p style="text-align:center;font-size:11px;color:var(--text2);margin-top:16px">OMRP LLM Router &mdash; <span id="app-name">OMRP</span></p>
+  </div>
+  <!-- Register sub-panel (shown when registration_open=1) -->
+  <div id="reg-panel" class="login-card" style="display:none;margin-top:16px">
+    <h2 style="font-size:18px;margin:0 0 12px">Create account</h2>
+    <div id="reg-err" class="login-err"></div>
+    <div class="form-group">
+      <label class="form-label">Username</label>
+      <input id="r-user" class="form-input" type="text" placeholder="yourname" autocomplete="username">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Password</label>
+      <input id="r-pass" class="form-input" type="password" placeholder="8+ characters" autocomplete="new-password">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Display name <span style="color:var(--text2)">(optional)</span></label>
+      <input id="r-name" class="form-input" type="text" placeholder="Your Name">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Email <span style="color:var(--text2)">(optional)</span></label>
+      <input id="r-email" class="form-input" type="email" placeholder="you@example.com">
+    </div>
+    <button id="btn-register" class="btn btn-primary btn-full" onclick="doRegister()">Create Account</button>
+    <p style="text-align:center;font-size:11px;margin-top:10px">
+      <a href="#" onclick="hideRegister();return false" style="color:var(--text2)">← Back to sign in</a>
+    </p>
   </div>
 </div>
 
@@ -1840,6 +1870,39 @@ async function doLogout() {
   show('pg-login');
 }
 
+// ── Self-registration ───────────────────────────────────────────────
+function showRegister() {
+  document.getElementById('reg-panel').style.display = 'block';
+  document.getElementById('r-user').focus();
+}
+function hideRegister() {
+  document.getElementById('reg-panel').style.display = 'none';
+  document.getElementById('reg-err').style.display = 'none';
+}
+
+async function doRegister() {
+  const errEl = document.getElementById('reg-err');
+  errEl.style.display = 'none';
+  const username     = document.getElementById('r-user').value.trim();
+  const password     = document.getElementById('r-pass').value;
+  const display_name = document.getElementById('r-name').value.trim() || undefined;
+  const email        = document.getElementById('r-email').value.trim() || undefined;
+  if (!username || !password) {
+    errEl.style.display = 'block'; errEl.textContent = 'Username and password required'; return;
+  }
+  const done = loadBtn('btn-register', 'Creating…');
+  const r = await POST('/api/auth/register', { username, password, display_name, email });
+  done();
+  if (r.error) { errEl.style.display='block'; errEl.textContent=r.error.message; return; }
+  // Successful registration → auto-login
+  S.token = r.token;
+  S.user  = { user_id: r.user_id, username: r.username, is_admin: false };
+  localStorage.setItem('omrp_token', r.token);
+  localStorage.setItem('omrp_user', JSON.stringify(S.user));
+  toast(`Welcome, ${r.username}! Your API key: ${r.api_key}`, 'ok', 10000);
+  startApp();
+}
+
 function startApp() {
   document.getElementById('sb-username').textContent = S.user.username;
   document.getElementById('sb-role').innerHTML = S.user.is_admin
@@ -1863,7 +1926,7 @@ function show(id) {
 }
 
 async function boot() {
-  // 1. Check onboarding
+  // 1. Check onboarding + registration status
   try {
     const st = await fetch('/api/setup/status').then(r=>r.json()).catch(()=>({}));
     if (st.onboarding_needed) {
@@ -1872,6 +1935,9 @@ async function boot() {
       renderSetupStep();
       return;
     }
+    // Show "Create account" link on login page when registration is open
+    const regLink = document.getElementById('login-reg-link');
+    if (regLink) regLink.style.display = st.registration_open ? 'block' : 'none';
   } catch(_) {}
 
   // 2. Try to restore session
